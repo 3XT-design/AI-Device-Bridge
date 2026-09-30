@@ -1,0 +1,235 @@
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+from ai_device_bridge.domain.models import (
+    DeviceProfile,
+    PlanStatus,
+    SourceMode,
+    TransferDirection,
+    TransferPlan,
+    TransferRecord,
+    TransferStatus,
+    TransferTask,
+)
+from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
+
+
+def test_sqlite_repository_round_trips_core_entities(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    now = datetime.now(UTC)
+    sender = DeviceProfile(uuid4(), "Laptop", "sha256:laptop-key", "Windows", now)
+    receiver = DeviceProfile(uuid4(), "Desktop", "sha256:desktop-key", "Windows", now)
+    plan = TransferPlan(
+        plan_id=uuid4(),
+        source_device_id=sender.device_id,
+        source_path="C:/work/report.txt",
+        target_device_id=receiver.device_id,
+        target_directory="D:/BridgeInbox",
+        source_mode=SourceMode.MANUAL,
+        file_name="report.txt",
+        file_size_bytes=128,
+        status=PlanStatus.CONFIRMED,
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        expected_sha256="b" * 64,
+    )
+    task = TransferTask(
+        task_id=uuid4(),
+        plan_id=plan.plan_id,
+        sender_device_id=sender.device_id,
+        receiver_device_id=receiver.device_id,
+        file_name="report.txt",
+        file_size_bytes=128,
+        expected_sha256="a" * 64,
+        bytes_transferred=128,
+        status=TransferStatus.COMPLETED,
+        created_at=now,
+        updated_at=now,
+    )
+    record = TransferRecord(
+        record_id=uuid4(),
+        task_id=task.task_id,
+        direction=TransferDirection.SENT,
+        peer_device_id=receiver.device_id,
+        file_name="report.txt",
+        file_size_bytes=128,
+        status=TransferStatus.COMPLETED,
+        started_at=now,
+        finished_at=now,
+    )
+
+    repository.save_device(sender)
+    repository.save_device(receiver)
+    repository.save_plan(plan)
+    repository.save_task(task)
+    repository.save_record(record)
+
+    assert repository.get_device(sender.device_id) == sender
+    assert repository.list_devices() == [receiver, sender]
+    assert repository.get_plan(plan.plan_id) == plan
+    assert repository.get_task(task.task_id) == task
+    assert repository.list_records() == [record]
+
+
+def test_local_node_id_is_stable_across_repository_restarts(tmp_path) -> None:
+    database_path = tmp_path / "bridge.sqlite3"
+    first_id = SQLiteRepository(database_path).get_or_create_node_id()
+    second_id = SQLiteRepository(database_path).get_or_create_node_id()
+
+    assert first_id == second_id
+
+
+def test_local_device_profile_is_persisted_and_updates_name(tmp_path) -> None:
+    database_path = tmp_path / "bridge.sqlite3"
+    repository = SQLiteRepository(database_path)
+    first = repository.get_or_create_local_device("Laptop", "Windows")
+    restarted = SQLiteRepository(database_path)
+    updated = restarted.get_or_create_local_device("Laptop-2", "Windows")
+
+    assert first.device_id == updated.device_id
+    assert updated.device_name == "Laptop-2"
+
+
+def test_peer_address_is_saved_and_removed_with_peer(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    peer = DeviceProfile(uuid4(), "Desktop", "not-configured", "Windows", datetime.now(UTC))
+
+    repository.save_peer(peer, "192.168.1.20:8765")
+    assert repository.get_device(peer.device_id) == peer
+    assert repository.list_paired_devices() == [peer]
+    assert repository.get_peer_address(peer.device_id) == "192.168.1.20:8765"
+
+    assert repository.remove_device(peer.device_id)
+    assert repository.get_device(peer.device_id) is None
+    assert repository.list_paired_devices() == []
+    assert repository.get_peer_address(peer.device_id) is None
+
+
+def test_unpair_preserves_device_referenced_by_transfer_plan(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    now = datetime.now(UTC)
+    sender = repository.get_or_create_local_device("Laptop", "Windows")
+    receiver = DeviceProfile(uuid4(), "Desktop", "a" * 64, "Windows", now)
+    repository.save_peer(
+        receiver,
+        "192.168.1.20:8765",
+        certificate_pem="certificate",
+        transfer_token="token",
+    )
+    plan = TransferPlan(
+        plan_id=uuid4(),
+        source_device_id=sender.device_id,
+        source_path="C:/work/report.txt",
+        target_device_id=receiver.device_id,
+        target_directory="Inbox",
+        source_mode=SourceMode.MANUAL,
+        file_name="report.txt",
+        file_size_bytes=12,
+        status=PlanStatus.CONFIRMED,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+        expected_sha256="b" * 64,
+    )
+    repository.save_plan(plan)
+
+    assert repository.remove_device(receiver.device_id)
+
+    assert repository.get_plan(plan.plan_id) == plan
+    assert repository.get_device(receiver.device_id) == receiver
+    assert repository.list_paired_devices() == []
+    assert repository.get_peer_address(receiver.device_id) is None
+    assert repository.get_peer_security(receiver.device_id) == ("", "")
+
+
+def test_peer_security_and_receive_token_are_persisted(tmp_path) -> None:
+    database_path = tmp_path / "bridge.sqlite3"
+    repository = SQLiteRepository(database_path)
+    peer = DeviceProfile(uuid4(), "Desktop", "a" * 64, "Windows", datetime.now(UTC))
+    repository.save_peer(peer, "192.168.1.20:8765", "peer certificate", "peer token")
+
+    assert repository.get_peer_security(peer.device_id) == ("peer token", "peer certificate")
+    assert (
+        repository.get_or_create_receive_token()
+        == SQLiteRepository(database_path).get_or_create_receive_token()
+    )
+
+
+def test_repository_migrates_existing_plan_table_for_file_hash(tmp_path) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY,
+                device_name TEXT NOT NULL,
+                public_key_fingerprint TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE plans (
+                plan_id TEXT PRIMARY KEY,
+                source_device_id TEXT NOT NULL REFERENCES devices(device_id),
+                source_path TEXT NOT NULL,
+                target_device_id TEXT NOT NULL REFERENCES devices(device_id),
+                target_directory TEXT NOT NULL,
+                source_mode TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            """
+        )
+
+    SQLiteRepository(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(plans)")}
+    assert "expected_sha256" in columns
+
+
+def test_delete_plan_hides_from_recent_list_and_preserves_transfer_history(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    now = datetime.now(UTC)
+    sender = DeviceProfile(uuid4(), "Laptop", "sender", "Windows", now)
+    receiver = DeviceProfile(uuid4(), "Desktop", "receiver", "Windows", now)
+    plan = TransferPlan(
+        plan_id=uuid4(),
+        source_device_id=sender.device_id,
+        source_path="C:/work/report.txt",
+        target_device_id=receiver.device_id,
+        target_directory="Inbox",
+        source_mode=SourceMode.MANUAL,
+        file_name="report.txt",
+        file_size_bytes=7,
+        status=PlanStatus.COMPLETED,
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+        expected_sha256="c" * 64,
+    )
+    task = TransferTask(
+        task_id=uuid4(),
+        plan_id=plan.plan_id,
+        sender_device_id=sender.device_id,
+        receiver_device_id=receiver.device_id,
+        file_name=plan.file_name,
+        file_size_bytes=plan.file_size_bytes,
+        expected_sha256=plan.expected_sha256,
+        bytes_transferred=7,
+        status=TransferStatus.COMPLETED,
+        created_at=now,
+        updated_at=now,
+    )
+    repository.save_device(sender)
+    repository.save_device(receiver)
+    repository.save_plan(plan)
+    repository.save_task(task)
+
+    assert repository.delete_plan(plan.plan_id)
+
+    assert repository.list_plans() == []
+    assert repository.get_plan(plan.plan_id).status is PlanStatus.DELETED
+    assert repository.get_task(task.task_id) == task
+    assert not repository.delete_plan(plan.plan_id)
