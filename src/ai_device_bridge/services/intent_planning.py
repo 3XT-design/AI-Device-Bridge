@@ -25,6 +25,7 @@ class IntentSearchResult:
     ranking_source: str
     request_text: str
     authorized_root: str
+    scanned_count: int = 0
 
 
 def parse_transfer_intent(
@@ -70,8 +71,7 @@ def parse_transfer_intent(
         after = (local_monday - timedelta(days=7)).astimezone(UTC)
         before = local_monday.astimezone(UTC)
     elif "最近" in text:
-        after = (now - timedelta(days=30)).astimezone(UTC)
-        questions.append("“最近”暂按过去 30 天筛选，请核对时间范围。")
+        questions.append("“最近”按修改时间从新到旧排序，不限制日期。")
 
     extensions = re.findall(
         r"\.(pdf|docx?|xlsx?|pptx?|txt|md|zip|png|jpe?g)(?![A-Za-z0-9])", text, re.I
@@ -109,7 +109,7 @@ def parse_transfer_intent(
         modified_after=after,
         modified_before=before,
     )
-    if not (query.keywords or query.extensions or query.modified_after):
+    if not (query.keywords or query.extensions or query.modified_after or "最近" in text):
         questions.append("文件条件不够明确，请补充文件名、类型或时间。")
     return ParsedTransferIntent(
         file_query=query,
@@ -173,11 +173,31 @@ def search_intent(
     """Only cataloged file IDs may become suggestions; Ollama failure stays reviewable."""
     intent = parse_transfer_intent(request, paired_device_names)
     authorized_root = str(Path(root).expanduser().resolve(strict=True))
-    considered = deterministic_candidates(intent.file_query, discover_files(authorized_root))
+    catalog = discover_files(authorized_root)
+    considered = deterministic_candidates(intent.file_query, catalog)
     if not considered:
+        message = (
+            "授权目录中没有可检索的普通文件；请检查目录或手动选择文件。"
+            if not catalog
+            else f"已扫描 {len(catalog)} 个文件，但没有符合条件的候选；请调整描述。"
+        )
         return IntentSearchResult(
-            intent, (), (), "没有找到符合条件的文件，请修改描述或授权目录。", "local",
-            request, authorized_root,
+            intent, (), (), message, "local", request, authorized_root, len(catalog),
+        )
+    if not (
+        intent.file_query.keywords
+        or intent.file_query.extensions
+        or intent.file_query.modified_after
+    ):
+        selected = considered[:10]
+        clarification = (
+            "按修改时间展示最近的候选；如未看到目标文件，请补充文件名或类型。"
+        )
+        if intent.clarification_question:
+            clarification = f"{clarification} {intent.clarification_question}"
+        return IntentSearchResult(
+            intent, selected, considered, clarification, "local", request, authorized_root,
+            len(catalog),
         )
     try:
         ranked = rank_candidates_with_ollama(request, list(considered), ollama_url, model)
@@ -197,5 +217,6 @@ def search_intent(
     if intent.clarification_question:
         clarification = f"{clarification} {intent.clarification_question}".strip()
     return IntentSearchResult(
-        intent, selected, considered, clarification, source, request, authorized_root
+        intent, selected, considered, clarification, source, request, authorized_root,
+        len(catalog),
     )

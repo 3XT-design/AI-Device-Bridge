@@ -544,7 +544,10 @@ class MainWindow(QMainWindow):
             self.candidate_list.addItem(item)
         count = self.candidate_list.count()
         source = "Ollama 排序" if result.ranking_source == "ollama" else "本地匹配"
-        status = f"{source}返回 {count} 个候选。请选择文件，再审核设备、目录和计划。"
+        status = (
+            f"{source}返回 {count} 个候选（授权目录已扫描 {result.scanned_count} 个文件）。"
+            "请选择文件，再审核设备、目录和计划。"
+        )
         if result.intent.target_device_name:
             status += f"\n描述中的设备：{result.intent.target_device_name}（需从已配对列表核对）。"
         if result.intent.target_directory_name:

@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import UTC, datetime
 
 import httpx
@@ -123,7 +124,39 @@ def test_no_match_stops_before_model_and_multiple_local_matches_require_choice(
                              "http://127.0.0.1:11434", "model")
     assert no_match.candidates == ()
     assert no_match.considered == ()
-    assert "没有找到" in no_match.clarification
+    assert "没有符合条件" in no_match.clarification
+    assert no_match.scanned_count == 2
+
+
+def test_recent_files_are_sorted_without_an_arbitrary_age_cutoff(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    older = root / "旧文件.txt"
+    newer = root / "较新文件.txt"
+    older.write_text("old", encoding="utf-8")
+    newer.write_text("new", encoding="utf-8")
+    for path, year in ((older, 2022), (newer, 2024)):
+        stamp = datetime(year, 1, 1, tzinfo=UTC).timestamp()
+        os.utime(path, (stamp, stamp))
+
+    def should_not_call_model(*_args, **_kwargs):
+        raise AssertionError("a recency-only request needs no model ranking")
+
+    monkeypatch.setattr(
+        "ai_device_bridge.services.file_catalog.httpx.post", should_not_call_model
+    )
+    result = search_intent(
+        str(root), "找最近修改的文件发到台式机", ("台式机",),
+        "http://127.0.0.1:11434", "model",
+    )
+    assert result.intent.file_query.modified_after is None
+    assert result.intent.target_device_name == "台式机"
+    assert result.ranking_source == "local"
+    assert result.scanned_count == 2
+    assert [item.file_name for item in result.candidates] == ["较新文件.txt", "旧文件.txt"]
+    assert "不限制日期" in result.clarification
 
 
 @pytest.mark.parametrize(

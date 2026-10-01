@@ -1,5 +1,5 @@
 #define AppName "AI Device Bridge"
-#define AppVersion "0.4.0rc1"
+#define AppVersion "0.4.0rc2"
 #define AppPublisher "AI Device Bridge"
 #define AppExeName "AI Device Bridge.exe"
 #define ProjectRoot AddBackslash(SourcePath) + ".."
