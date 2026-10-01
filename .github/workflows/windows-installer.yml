@@ -62,6 +62,7 @@ jobs:
               Write-Host "::error title=Packaged smoke error::No traceback file was produced."
             }
             throw "Packaged node smoke check failed."
+          }
       - name: Smoke check packaged M7 pose model
         shell: pwsh
         run: |
@@ -74,7 +75,6 @@ jobs:
               Get-Content $env:AI_DEVICE_BRIDGE_SMOKE_REPORT
             }
             throw "Packaged M7 pose model smoke check failed."
-          }
           }
       - name: Smoke check installed package
         shell: pwsh
