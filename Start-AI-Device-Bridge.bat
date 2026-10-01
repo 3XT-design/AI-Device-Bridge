@@ -12,19 +12,20 @@ if not exist "%PROJECT_DIR%pyproject.toml" (
 )
 
 cd /d "%PROJECT_DIR%" || goto :failed
-set "VENV_PY=%PROJECT_DIR%.venv\Scripts\python.exe"
+set "VENV_DIR=%LOCALAPPDATA%\AI-Device-Bridge\venv"
+set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 
 if not exist "%VENV_PY%" (
     echo Creating Python environment with Python 3.12...
-    py -3.12 -m venv ".venv" >nul 2>&1
+    py -3.12 -m venv "%VENV_DIR%" >nul 2>&1
     if not exist "%VENV_PY%" (
         echo Trying Python 3.13...
-        py -3.13 -m venv ".venv" >nul 2>&1
+        py -3.13 -m venv "%VENV_DIR%" >nul 2>&1
     )
     if not exist "%VENV_PY%" (
         echo Trying the default Python installation...
         python -c "import sys; assert sys.version_info.major == 3 and sys.version_info.minor in [12, 13]" >nul 2>&1
-        if not errorlevel 1 python -m venv ".venv"
+        if not errorlevel 1 python -m venv "%VENV_DIR%"
     )
 )
 
@@ -35,8 +36,8 @@ if not exist "%VENV_PY%" (
 
 "%VENV_PY%" -c "import sys; assert sys.version_info.major == 3 and sys.version_info.minor in [12, 13]"
 if errorlevel 1 (
-    echo The existing .venv uses an unsupported Python version.
-    echo Rename the .venv folder, then run this file again.
+    echo The existing virtual environment uses an unsupported Python version.
+    echo Rename "%VENV_DIR%", then run this file again.
     goto :failed
 )
 

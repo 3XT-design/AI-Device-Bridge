@@ -18,7 +18,7 @@ M1-09 补充双节点端到端测试、Windows 可执行文件/安装包构建�
 
 ### 双击启动源码包（Windows）
 
-将源码 ZIP 解压到一个新目录，然后双击解压目录最外层的 `Start-AI-Device-Bridge.bat`。它会自动找到 `ai-device-bridge` 项目，复用已有的 `.venv`；首次启动时需要已安装的 Python 3.12 或 3.13，并会安装依赖。以后更新版本时，下载并解压新版 ZIP，再双击新版 BAT 即可，不需要修改压缩包名称或 PowerShell 命令。启动期间保留的命令行窗口会显示安装或运行错误。BAT 运行的是源码；M3 的正式验收仍需单独检查 Windows 安装包。
+将源码 ZIP 解压到一个新目录，然后双击解压目录最外层的 `Start-AI-Device-Bridge.bat`。它会自动找到项目，并在 `%LOCALAPPDATA%\AI-Device-Bridge\venv` 创建或复用虚拟环境，避免解压路径较长时 PySide6 安装失败；首次启动时需要已安装的 Python 3.12 或 3.13，并会安装依赖。此前解压目录中的 `.venv` 不再使用，也无需手动删除。以后更新版本时，下载并解压新版 ZIP，再双击新版 BAT 即可，不需要修改压缩包名称或 PowerShell 命令。启动期间保留的命令行窗口会显示安装或运行错误。BAT 运行的是源码；M3 的正式验收仍需单独检查 Windows 安装包。
 
 需要 Python 3.12 或 3.13。解压源码包，在 PowerShell 进入包含 `pyproject.toml` 的项目目录：
 
