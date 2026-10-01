@@ -363,7 +363,7 @@ class MainWindow(QMainWindow):
         token_controls.addWidget(self.rotate_grant_button)
         layout.addLayout(token_controls)
         token_hint = QLabel(
-            "若该设备为接收端，则该码需填写在发送端的(发送文件页面-接收设备授权码处)"
+            "若当前使用设备为接收端，则该码需填写在发送端的(发送文件页面-接收设备授权码处)"
         )
         token_hint.setWordWrap(True)
         hint_font = token_hint.font()
