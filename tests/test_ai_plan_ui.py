@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from ai_device_bridge import __version__
 from ai_device_bridge.app import MainWindow
 from ai_device_bridge.domain.models import DeviceProfile, SourceMode
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
@@ -39,6 +40,10 @@ def test_reviewed_candidate_creates_traceable_ai_plan_without_sending(
     window = MainWindow(
         SimpleNamespace(stop=lambda: None), repository, local.device_id, "fingerprint", "token"
     )
+    assert [window.tabs.tabText(index) for index in range(window.tabs.count())] == [
+        "设备与配对", "发送文件", "AI 查找", "历史与诊断",
+    ]
+    window.tabs.setCurrentIndex(2)
     window.file_query.setText(request)
     window.authorized_root.setText(str(root))
     window.on_file_search_succeeded(result)
@@ -52,6 +57,9 @@ def test_reviewed_candidate_creates_traceable_ai_plan_without_sending(
     )
 
     window.create_transfer_plan(from_ai_candidate=True)
+    assert window.tabs.currentWidget() is window.send_page
+    assert window.plan_list.currentItem() is not None
+    assert window.selected_peer_label.text() == "接收设备：Desktop"
 
     plans = repository.list_plans()
     assert len(plans) == 1
@@ -92,8 +100,15 @@ def test_m5_guidance_search_and_copied_diagnostics(tmp_path, monkeypatch) -> Non
     window._record_issue("CONNECTION_FAILED", "token=sensitive-receive-token")
     window.copy_diagnostics()
     copied = application.clipboard().text()
-    assert "0.5.0rc1" in copied
+    assert __version__ in copied
     assert "sensitive-receive-token" not in copied
     assert "数据库版本：3" in copied
+    window.tabs.setCurrentIndex(1)
+    window.plan_filter.setText("report")
+    window.tabs.setCurrentIndex(3)
+    window.tabs.setCurrentIndex(1)
+    assert window.plan_filter.text() == "report"
+    window.choose_peer_tab_button.click()
+    assert window.tabs.currentIndex() == 0
     window.history_timer.stop()
     window.close()

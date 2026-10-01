@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -254,9 +255,9 @@ class MainWindow(QMainWindow):
         intro = QLabel("M5：查找并审核文件、选择接收设备后，通过 HTTPS 传输并校验 SHA-256。")
         intro.setWordWrap(True)
         self.guide_label = QLabel(
-            "首次使用：① 两台电脑启动本机服务；② 输入对端地址并检查设备；"
-            "③ 核对 TLS 指纹并保存配对；④ 从接收端复制授权码到发送端并保存；"
-            "⑤ 选择文件、确认计划，然后发送。AI 查找需先选择授权目录。"
+            "首次使用：① 在“设备与配对”页，两台电脑启动服务，检查地址并核对 TLS 指纹；"
+            "② 在“发送文件”页保存接收端授权码，选择文件并确认计划；"
+            "③ 发送后到“历史与诊断”页查看结果。要用 AI 查找文件，请打开“AI 查找”页。"
         )
         self.guide_label.setWordWrap(True)
         self.dismiss_guide_button = QPushButton("已了解，隐藏指引")
@@ -297,6 +298,7 @@ class MainWindow(QMainWindow):
         self.peer_status.setWordWrap(True)
 
         self.peer_list = QListWidget()
+        self.peer_list.setMaximumHeight(200)
         self.empty_peer_label = QLabel("暂无已配对设备。检查设备后，点击“确认并保存配对”添加。")
         self.paired_devices_label = QLabel("已配对设备（0）")
         self.remove_peer_button = QPushButton("解除配对")
@@ -335,12 +337,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(note)
         layout.addStretch()
 
-        container = QWidget()
-        container.setLayout(layout)
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(container)
-        self.setCentralWidget(scroll_area)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.setCentralWidget(self.tabs)
+        self._add_page("设备与配对", layout)
 
         self.start_button.clicked.connect(self.start_local_service)
         self.stop_button.clicked.connect(self.stop_local_service)
@@ -351,6 +351,7 @@ class MainWindow(QMainWindow):
         self.peer_address.textChanged.connect(self.invalidate_checked_peer)
         self.refresh_peer_list()
 
+        layout = QVBoxLayout()
         self.choose_file_button = QPushButton("选择文件并计算校验值")
         self.file_status = QLabel("尚未选择文件")
         self.file_status.setWordWrap(True)
@@ -361,7 +362,11 @@ class MainWindow(QMainWindow):
         self.create_plan_button.setEnabled(False)
         self.preparation_hint = QLabel()
         self.preparation_hint.setWordWrap(True)
+        self.selected_peer_label = QLabel("接收设备：未选择")
+        self.choose_peer_tab_button = QPushButton("前往“设备与配对”选择接收设备")
+        self.choose_peer_tab_button.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
         self.plan_list = QListWidget()
+        self.plan_list.setMaximumHeight(230)
         self.plan_filter = QLineEdit()
         self.plan_filter.setPlaceholderText("搜索最近 500 条计划：文件名、设备或状态")
         self.plan_status = QLabel(
@@ -392,8 +397,9 @@ class MainWindow(QMainWindow):
         self.delete_plan_button = QPushButton("删除所选计划")
         self.delete_plan_button.setEnabled(False)
 
-        layout.addSpacing(12)
-        layout.addWidget(QLabel("文件传输计划（M1-07）"))
+        layout.addWidget(QLabel("选择文件、确认计划并发送"))
+        layout.addWidget(self.selected_peer_label)
+        layout.addWidget(self.choose_peer_tab_button)
         file_controls = QHBoxLayout()
         file_controls.addWidget(self.choose_file_button)
         file_controls.addWidget(self.file_status, 1)
@@ -418,10 +424,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(plan_action_controls)
         layout.addWidget(self.transfer_progress)
         layout.addWidget(self.plan_status)
-        layout.addWidget(QLabel("最近传输历史"))
-        layout.addWidget(self.history_filter)
-        layout.addWidget(self.transfer_history)
-        layout.addWidget(self.prune_history_button)
 
         self.choose_file_button.clicked.connect(self.choose_file)
         self.create_plan_button.clicked.connect(self.create_transfer_plan)
@@ -439,7 +441,10 @@ class MainWindow(QMainWindow):
         self.history_timer.setInterval(3000)
         self.history_timer.timeout.connect(self.refresh_transfer_history)
         self.history_timer.start()
+        layout.addStretch()
+        self.send_page = self._add_page("发送文件", layout)
 
+        layout = QVBoxLayout()
         self.authorized_root = QLineEdit(repository.get_setting("authorized_root"))
         self.authorized_root.setReadOnly(True)
         self.choose_root_button = QPushButton("选择授权目录")
@@ -469,7 +474,7 @@ class MainWindow(QMainWindow):
         model_controls.addWidget(QLabel("模型"))
         model_controls.addWidget(self.ollama_model)
         model_controls.addWidget(self.save_ai_settings_button)
-        layout.addWidget(QLabel("AI 文件、设备与目录意图计划（M4）"))
+        layout.addWidget(QLabel("查找候选文件并审核计划"))
         layout.addLayout(root_controls)
         layout.addLayout(model_controls)
         layout.addWidget(self.file_query)
@@ -489,6 +494,14 @@ class MainWindow(QMainWindow):
         )
         self.file_query.textChanged.connect(self.invalidate_search_results)
         self.update_search_button_state()
+        layout.addStretch()
+        self._add_page("AI 查找", layout)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("传输历史"))
+        layout.addWidget(self.history_filter)
+        layout.addWidget(self.transfer_history)
+        layout.addWidget(self.prune_history_button)
         self.diagnostic_button = QPushButton("复制诊断信息")
         self.diagnostic_button.clicked.connect(self.copy_diagnostics)
         self.diagnostic_status = QLabel("诊断信息包含版本、数据目录、数据库版本及最近错误。")
@@ -496,7 +509,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("诊断与支持"))
         layout.addWidget(self.diagnostic_button)
         layout.addWidget(self.diagnostic_status)
+        layout.addStretch()
+        self._add_page("历史与诊断", layout)
         self.update_plan_button_state()
+
+    def _add_page(self, title: str, layout: QVBoxLayout) -> QScrollArea:
+        layout.setContentsMargins(16, 16, 16, 16)
+        container = QWidget()
+        container.setLayout(layout)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(container)
+        self.tabs.addTab(scroll_area, title)
+        return scroll_area
 
     def dismiss_guide(self) -> None:
         self.repository.save_setting("onboarding_done", "1")
@@ -641,6 +666,7 @@ class MainWindow(QMainWindow):
         self.search_result = result
         self.candidate_list.clear()
         self.selected_peer_id = None
+        self.selected_peer_label.setText("接收设备：未选择")
         self.peer_list.setCurrentRow(-1)
         self.peer_token.clear()
         self.save_peer_token_button.setEnabled(False)
@@ -808,6 +834,7 @@ class MainWindow(QMainWindow):
         self.last_checked_peer = None
         self.pair_button.setEnabled(False)
         self.selected_peer_id = None
+        self.selected_peer_label.setText("接收设备：未选择")
         self.update_plan_button_state()
 
     def on_health_check_succeeded(self, response: HealthResponse) -> None:
@@ -862,6 +889,7 @@ class MainWindow(QMainWindow):
         )
         if self.peer_list.count() > 0:
             self.peer_list.setCurrentRow(self.peer_list.count() - 1)
+            self.select_peer(self.peer_list.currentItem())
 
     def refresh_peer_list(self) -> None:
         self.peer_list.clear()
@@ -889,6 +917,10 @@ class MainWindow(QMainWindow):
             self.peer_address.setText(address)
             self.selected_peer_id = device_id
             self.peer_status.setText("已载入该设备保存的地址；点击“检查设备”刷新在线状态。")
+        device = self.repository.get_device(device_id)
+        self.selected_peer_label.setText(
+            f"接收设备：{device.device_name}" if device else "接收设备：未选择"
+        )
         self.update_plan_button_state()
 
     def choose_file(self) -> None:
@@ -1061,8 +1093,17 @@ class MainWindow(QMainWindow):
         except (sqlite3.Error, ValueError) as error:
             self.plan_status.setText(f"计划保存失败：{error}")
             return
+        if from_ai_candidate:
+            self.plan_filter.clear()
         self.refresh_plan_list()
         self.plan_status.setText(f"传输计划已保存（{plan.plan_id}），文件仍保留在本机，尚未发送。")
+        if from_ai_candidate:
+            for index in range(self.plan_list.count()):
+                item = self.plan_list.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == str(plan.plan_id):
+                    self.plan_list.setCurrentItem(item)
+                    break
+            self.tabs.setCurrentWidget(self.send_page)
 
     def refresh_plan_list(self) -> None:
         selected = self.plan_list.currentItem()
@@ -1371,6 +1412,7 @@ class MainWindow(QMainWindow):
                 return
             if self.selected_peer_id == device_id:
                 self.selected_peer_id = None
+                self.selected_peer_label.setText("接收设备：未选择")
                 self.save_peer_token_button.setEnabled(False)
                 self.peer_token.clear()
                 self.peer_address.clear()
