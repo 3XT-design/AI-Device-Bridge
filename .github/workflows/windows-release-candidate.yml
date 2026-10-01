@@ -44,12 +44,12 @@ jobs:
           $env:AI_DEVICE_BRIDGE_SMOKE_REPORT = Join-Path $env:RUNNER_TEMP "bridge-smoke-report.txt"
           Remove-Item $env:AI_DEVICE_BRIDGE_SMOKE_REPORT -Force -ErrorAction SilentlyContinue
           try {
-            & (Join-Path $portableDir "AI Device Bridge.exe") --smoke-node
+            $smoke = Start-Process -FilePath (Join-Path $portableDir "AI Device Bridge.exe") -ArgumentList "--smoke-node" -Wait -PassThru
           } catch {
             Write-Host "::error title=Portable EXE launch failed::$($_.Exception.Message)"
             throw
           }
-          if ($LASTEXITCODE -ne 0) {
+          if ($smoke.ExitCode -ne 0) {
             $errorFile = $env:AI_DEVICE_BRIDGE_SMOKE_REPORT
             if (Test-Path $errorFile) {
               $lastLine = Get-Content $errorFile | Select-Object -Last 1
@@ -69,12 +69,12 @@ jobs:
         run: |
           $installer = Resolve-Path ./release/AI-Device-Bridge-Setup.exe
           $installDir = Join-Path $env:RUNNER_TEMP "Bridge Installed"
-          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) { throw "Silent install failed." }
+          $install = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$installDir`"") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Silent install failed." }
           $env:AI_DEVICE_BRIDGE_SMOKE_REPORT = Join-Path $env:RUNNER_TEMP "bridge-smoke-report.txt"
           Remove-Item $env:AI_DEVICE_BRIDGE_SMOKE_REPORT -Force -ErrorAction SilentlyContinue
-          & (Join-Path $installDir "AI Device Bridge.exe") --smoke-node
-          if ($LASTEXITCODE -ne 0) {
+          $smoke = Start-Process -FilePath (Join-Path $installDir "AI Device Bridge.exe") -ArgumentList "--smoke-node" -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) {
             $errorFile = $env:AI_DEVICE_BRIDGE_SMOKE_REPORT
             if (Test-Path $errorFile) {
               Add-Content $env:GITHUB_STEP_SUMMARY '### Installed smoke error'
@@ -93,8 +93,8 @@ jobs:
           New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
           $marker = Join-Path $dataDir "ci-retention.txt"
           Set-Content -LiteralPath $marker -Value "preserve user data"
-          & (Join-Path $installDir "unins000.exe") /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-          if ($LASTEXITCODE -ne 0) { throw "Silent uninstall failed." }
+          $uninstall = Start-Process -FilePath (Join-Path $installDir "unins000.exe") -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Silent uninstall failed." }
           if (-not (Test-Path $marker)) { throw "Uninstall removed user data." }
       - uses: actions/upload-artifact@v4
         with:
