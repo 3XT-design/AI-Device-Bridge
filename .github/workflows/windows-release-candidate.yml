@@ -27,15 +27,39 @@ jobs:
       - name: Build portable package and installer
         shell: pwsh
         run: ./scripts/build_windows_release.ps1
-      - name: Smoke check portable ZIP
+      - name: Expand portable ZIP
         shell: pwsh
         run: |
           $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
-          Expand-Archive ./release/AI-Device-Bridge-portable-windows-x64.zip $portableDir
-          & (Join-Path $portableDir "AI Device Bridge.exe") --smoke-node
+          try {
+            Expand-Archive ./release/AI-Device-Bridge-portable-windows-x64.zip $portableDir
+          } catch {
+            Write-Host "::error title=Portable ZIP extraction failed::$($_.Exception.Message)"
+            throw
+          }
+      - name: Smoke check portable EXE
+        shell: pwsh
+        run: |
+          $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
+          try {
+            & (Join-Path $portableDir "AI Device Bridge.exe") --smoke-node
+          } catch {
+            Write-Host "::error title=Portable EXE launch failed::$($_.Exception.Message)"
+            throw
+          }
           if ($LASTEXITCODE -ne 0) {
             $errorFile = Join-Path $env:TEMP "ai-device-bridge-smoke-error.txt"
-            if (Test-Path $errorFile) { Get-Content $errorFile }
+            if (Test-Path $errorFile) {
+              $lastLine = Get-Content $errorFile | Select-Object -Last 1
+              Write-Host "::error title=Portable smoke error::$lastLine"
+              Add-Content $env:GITHUB_STEP_SUMMARY '### Portable smoke error'
+              Add-Content $env:GITHUB_STEP_SUMMARY '```text'
+              Get-Content $errorFile | Add-Content $env:GITHUB_STEP_SUMMARY
+              Add-Content $env:GITHUB_STEP_SUMMARY '```'
+              Get-Content $errorFile
+            } else {
+              Write-Host "::error title=Portable smoke error::No traceback file was produced."
+            }
             throw "Portable node smoke check failed."
           }
       - name: Smoke check installed package
@@ -48,7 +72,13 @@ jobs:
           & (Join-Path $installDir "AI Device Bridge.exe") --smoke-node
           if ($LASTEXITCODE -ne 0) {
             $errorFile = Join-Path $env:TEMP "ai-device-bridge-smoke-error.txt"
-            if (Test-Path $errorFile) { Get-Content $errorFile }
+            if (Test-Path $errorFile) {
+              Add-Content $env:GITHUB_STEP_SUMMARY '### Installed smoke error'
+              Add-Content $env:GITHUB_STEP_SUMMARY '```text'
+              Get-Content $errorFile | Add-Content $env:GITHUB_STEP_SUMMARY
+              Add-Content $env:GITHUB_STEP_SUMMARY '```'
+              Get-Content $errorFile
+            }
             throw "Installed node smoke check failed."
           }
       - name: Check uninstall preserves application data

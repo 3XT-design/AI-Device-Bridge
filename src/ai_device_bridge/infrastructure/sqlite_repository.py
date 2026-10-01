@@ -545,7 +545,7 @@ class SQLiteRepository:
     def cancel_receive_request(self, request_id: UUID, sender_device_id: UUID) -> bool:
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE receive_requests SET status = 'rejected' "
+                "UPDATE receive_requests SET status = 'cancelled' "
                 "WHERE request_id = ? AND sender_device_id = ? "
                 "AND status IN ('pending', 'approved')",
                 (str(request_id), str(sender_device_id)),
@@ -805,6 +805,16 @@ class SQLiteRepository:
                     UNION ALL
                     SELECT 'received', file_name, status, created_at, error_message
                     FROM incoming_transfers
+                    UNION ALL
+                    SELECT 'received', file_name,
+                           CASE status WHEN 'rejected' THEN 'rejected'
+                               WHEN 'cancelled' THEN 'cancelled' ELSE 'failed' END,
+                           created_at,
+                           CASE status WHEN 'rejected' THEN '接收端拒绝本次请求。'
+                               WHEN 'cancelled' THEN '发送端取消本次请求。'
+                               ELSE '等待接收确认超时。' END
+                    FROM receive_requests
+                    WHERE status IN ('rejected', 'cancelled', 'expired')
                 ) ORDER BY occurred_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
@@ -847,7 +857,8 @@ class SQLiteRepository:
                 (*terminal, cutoff),
             ).rowcount
             connection.execute(
-                "DELETE FROM receive_requests WHERE status IN ('rejected', 'expired', 'consumed') "
+                "DELETE FROM receive_requests WHERE status IN "
+                "('rejected', 'cancelled', 'expired', 'consumed') "
                 "AND julianday(expires_at) < julianday(?)",
                 (cutoff,),
             )

@@ -44,6 +44,7 @@ class NodeServer:
         self.require_receiver_approval = require_receiver_approval
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
+        self._startup_error: Exception | None = None
 
     @property
     def is_running(self) -> bool:
@@ -79,8 +80,16 @@ class NodeServer:
             ssl_keyfile=str(self.private_key_path),
         )
         self._server = uvicorn.Server(config)
+        self._startup_error = None
+
+        def serve() -> None:
+            try:
+                self._server.run()
+            except Exception as error:
+                self._startup_error = error
+
         self._thread = threading.Thread(
-            target=self._server.run,
+            target=serve,
             name="ai-device-bridge-node",
             daemon=True,
         )
@@ -94,7 +103,12 @@ class NodeServer:
                 break
             time.sleep(0.05)
 
+        startup_error = self._startup_error
         self.stop()
+        if startup_error is not None:
+            raise RuntimeError(
+                f"节点服务启动异常：{type(startup_error).__name__}: {startup_error}"
+            ) from startup_error
         raise RuntimeError(
             f"无法在端口 {self.port} 启动节点服务；请检查端口是否被占用或被系统策略阻止。"
         )

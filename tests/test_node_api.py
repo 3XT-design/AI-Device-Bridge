@@ -18,7 +18,7 @@ from ai_device_bridge.api.health import (
     create_app,
 )
 from ai_device_bridge.domain.models import DeviceProfile, TransferStatus
-from ai_device_bridge.infrastructure.node_server import cleanup_orphaned_parts
+from ai_device_bridge.infrastructure.node_server import NodeServer, cleanup_orphaned_parts
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 from ai_device_bridge.services.peer_health import PeerHealthError, normalize_base_url
 
@@ -136,6 +136,17 @@ def test_startup_cleanup_only_removes_bridge_temporary_uploads(tmp_path) -> None
     assert legitimate_file.read_bytes() == b"user file"
 
 
+def test_node_start_reports_background_tls_error(tmp_path) -> None:
+    server = NodeServer(
+        host="127.0.0.1", port=0,
+        certificate_path=tmp_path / "missing-cert.pem",
+        private_key_path=tmp_path / "missing-key.pem",
+        receive_directory=tmp_path / "Received",
+    )
+    with pytest.raises(RuntimeError, match="节点服务启动异常.*FileNotFoundError"):
+        server.start(timeout_seconds=1)
+
+
 def test_receive_transfer_rejects_bad_hash_traversal_and_overwrite(tmp_path) -> None:
     token = "example-receiver-token-that-is-long-enough"
     client = TestClient(create_app(
@@ -222,6 +233,10 @@ def test_strict_receiver_requires_paired_grant_and_one_time_approval(tmp_path) -
         "status": "rejected"
     }
     assert client.put(upload_url, headers=upload_headers, content=content).status_code == 403
+    assert any(
+        entry.status is TransferStatus.REJECTED
+        for entry in repository.list_history_entries()
+    )
 
     requested = client.post("/api/v1/transfers/requests", headers=auth, json=offer)
     request_id = UUID(requested.json()["request_id"])
@@ -249,8 +264,8 @@ def test_strict_receiver_requires_paired_grant_and_one_time_approval(tmp_path) -
     cancelled_id = requested.json()["request_id"]
     assert client.delete(
         f"/api/v1/transfers/requests/{cancelled_id}", headers=new_auth
-    ).json() == {"status": "rejected"}
-    assert repository.get_receive_request(UUID(cancelled_id)).status == "rejected"
+    ).json() == {"status": "cancelled"}
+    assert repository.get_receive_request(UUID(cancelled_id)).status == "cancelled"
     requested = client.post("/api/v1/transfers/requests", headers=new_auth, json=offer)
     with sqlite3.connect(repository.database_path) as connection:
         connection.execute(
