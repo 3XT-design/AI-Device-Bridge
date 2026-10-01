@@ -7,9 +7,10 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from uuid import UUID, uuid4
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -28,7 +30,13 @@ from PySide6.QtWidgets import (
 
 from ai_device_bridge import __version__
 from ai_device_bridge.api.health import HealthResponse
-from ai_device_bridge.domain.models import DeviceProfile, PlanStatus, SourceMode, TransferPlan
+from ai_device_bridge.domain.models import (
+    DeviceProfile,
+    PlanStatus,
+    SourceMode,
+    TransferPlan,
+    TransferStatus,
+)
 from ai_device_bridge.infrastructure.node_server import NodeServer
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 from ai_device_bridge.services.file_catalog import (
@@ -38,8 +46,9 @@ from ai_device_bridge.services.file_catalog import (
     rank_candidates_with_ollama,
 )
 from ai_device_bridge.services.file_inspection import FileInspection, inspect_file
-from ai_device_bridge.services.file_transfer import FileTransferError, send_file
+from ai_device_bridge.services.file_transfer import FileTransferError, TransferCancelled, send_file
 from ai_device_bridge.services.peer_health import PeerHealthError, check_peer_health
+from ai_device_bridge.services.transfer_journal import TransferJournal
 
 
 class HealthCheckWorker(QThread):
@@ -91,29 +100,84 @@ class FileTransferWorker(QThread):
 
     succeeded = Signal(object)
     failed = Signal(str)
+    cancelled = Signal(str)
+    phase_changed = Signal(str)
+    progress_changed = Signal(int)
 
-    def __init__(self, plan: TransferPlan, address: str, cert_pem: str, token: str) -> None:
+    def __init__(
+        self,
+        plan: TransferPlan,
+        address: str,
+        cert_pem: str,
+        token: str,
+        repository: SQLiteRepository,
+    ) -> None:
         super().__init__()
         self.plan = plan
         self.address = address
         self.cert_pem = cert_pem
         self.token = token
+        self.repository = repository
+        self.cancel_event = Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
 
     def run(self) -> None:
+        journal = None
         try:
-            self.succeeded.emit(
-                send_file(
-                    self.plan.source_path,
-                    self.address,
-                    self.cert_pem,
-                    self.token,
-                    self.plan.file_name,
-                    self.plan.target_directory,
-                    self.plan.file_size_bytes,
-                    self.plan.expected_sha256,
+            journal = TransferJournal.begin_sent(self.repository, self.plan)
+            last_saved_bytes = 0
+
+            def phase_changed(phase: str) -> None:
+                if phase == "transferring":
+                    journal.transition(TransferStatus.TRANSFERRING)
+                elif phase == "verifying":
+                    journal.transition(TransferStatus.VERIFYING)
+                self.phase_changed.emit(phase)
+
+            def progress_changed(sent: int) -> None:
+                nonlocal last_saved_bytes
+                persist = (
+                    sent == self.plan.file_size_bytes or sent - last_saved_bytes >= 4 * 1024 * 1024
                 )
+                journal.progress(sent, persist=persist)
+                if persist:
+                    last_saved_bytes = sent
+                self.progress_changed.emit(sent)
+
+            result = send_file(
+                self.plan.source_path,
+                self.address,
+                self.cert_pem,
+                self.token,
+                self.plan.file_name,
+                self.plan.target_directory,
+                self.plan.file_size_bytes,
+                self.plan.expected_sha256,
+                on_phase=phase_changed,
+                on_progress=progress_changed,
+                cancel_event=self.cancel_event,
             )
-        except FileTransferError as error:
+            journal.transition(TransferStatus.COMPLETED)
+            self.succeeded.emit(result)
+        except TransferCancelled as error:
+            if journal is not None:
+                try:
+                    journal.transition(TransferStatus.CANCELLED)
+                except sqlite3.Error:
+                    self.failed.emit("传输已中止，但本机历史保存失败；请检查接收端文件。")
+                    return
+            self.cancelled.emit(str(error))
+        except (FileTransferError, sqlite3.Error, OSError, ValueError) as error:
+            if journal is not None and journal.task.status not in {
+                TransferStatus.COMPLETED,
+                TransferStatus.FAILED,
+            }:
+                try:
+                    journal.fail(getattr(error, "code", "local_error"), str(error))
+                except (sqlite3.Error, ValueError):
+                    pass
             self.failed.emit(str(error))
 
 
@@ -279,6 +343,14 @@ class MainWindow(QMainWindow):
         self.save_peer_token_button.setEnabled(False)
         self.send_plan_button = QPushButton("发送所选计划")
         self.send_plan_button.setEnabled(False)
+        self.cancel_transfer_button = QPushButton("取消传输")
+        self.cancel_transfer_button.setEnabled(False)
+        self.transfer_progress = QProgressBar()
+        self.transfer_progress.setRange(0, 100)
+        self.transfer_progress.setValue(0)
+        self.transfer_progress.setFormat("尚未开始传输")
+        self.transfer_history = QListWidget()
+        self.transfer_history.setMaximumHeight(160)
         self.delete_plan_button = QPushButton("删除所选计划")
         self.delete_plan_button.setEnabled(False)
 
@@ -301,17 +373,27 @@ class MainWindow(QMainWindow):
         layout.addLayout(peer_token_controls)
         plan_action_controls = QHBoxLayout()
         plan_action_controls.addWidget(self.send_plan_button)
+        plan_action_controls.addWidget(self.cancel_transfer_button)
         plan_action_controls.addWidget(self.delete_plan_button)
         layout.addLayout(plan_action_controls)
+        layout.addWidget(self.transfer_progress)
         layout.addWidget(self.plan_status)
+        layout.addWidget(QLabel("最近传输历史"))
+        layout.addWidget(self.transfer_history)
 
         self.choose_file_button.clicked.connect(self.choose_file)
         self.create_plan_button.clicked.connect(self.create_transfer_plan)
         self.refresh_plan_list()
         self.save_peer_token_button.clicked.connect(self.save_selected_peer_token)
         self.send_plan_button.clicked.connect(self.send_selected_plan)
+        self.cancel_transfer_button.clicked.connect(self.cancel_active_transfer)
         self.delete_plan_button.clicked.connect(self.delete_selected_plan)
         self.plan_list.itemSelectionChanged.connect(self.update_send_button_state)
+        self.refresh_transfer_history()
+        self.history_timer = QTimer(self)
+        self.history_timer.setInterval(3000)
+        self.history_timer.timeout.connect(self.refresh_transfer_history)
+        self.history_timer.start()
 
         self.authorized_root = QLineEdit(repository.get_setting("authorized_root"))
         self.authorized_root.setReadOnly(True)
@@ -476,7 +558,11 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
 
     def stop_local_service(self) -> None:
-        self.node_server.stop()
+        try:
+            self.node_server.stop()
+        except RuntimeError as error:
+            self.local_status.setText(f"本机服务停止中：{error}")
+            return
         self.local_status.setText("本机节点服务已停止。")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -801,7 +887,12 @@ class MainWindow(QMainWindow):
         )
         active_plan_id = self.active_transfer_plan.plan_id if self.active_transfer_plan else None
         self.delete_plan_button.setEnabled(plan is not None and plan.plan_id != active_plan_id)
-        if plan is not None and not self.send_plan_button.isEnabled() and not transfer_busy:
+        if (
+            plan is not None
+            and plan.status is PlanStatus.CONFIRMED
+            and not self.send_plan_button.isEnabled()
+            and not transfer_busy
+        ):
             self.plan_status.setText(f"暂不能发送：{disabled_reason}")
 
     def send_selected_plan(self) -> None:
@@ -812,6 +903,9 @@ class MainWindow(QMainWindow):
         plan = self.repository.get_plan(UUID(item.data(Qt.ItemDataRole.UserRole)))
         if plan is None or plan.status is not PlanStatus.CONFIRMED:
             self.plan_status.setText("所选计划不可发送。")
+            return
+        if not plan.expected_sha256:
+            self.plan_status.setText("该计划没有文件校验值，请重新选择文件并生成计划。")
             return
         if plan.expires_at <= datetime.now(UTC):
             plan.status = PlanStatus.EXPIRED
@@ -835,28 +929,112 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self.send_plan_button.setEnabled(False)
-        self.plan_status.setText("正在通过 HTTPS 发送并等待接收端校验……")
+        self.plan_status.setText("正在检查源文件……")
+        self.transfer_progress.setValue(0)
+        self.transfer_progress.setFormat("正在检查源文件")
+        self.cancel_transfer_button.setEnabled(True)
         self.active_transfer_plan = plan
-        self.transfer_worker = FileTransferWorker(plan, address, certificate_pem, token)
+        self.transfer_worker = FileTransferWorker(
+            plan, address, certificate_pem, token, self.repository
+        )
         self.transfer_worker.succeeded.connect(self.on_transfer_succeeded)
         self.transfer_worker.failed.connect(self.on_transfer_failed)
+        self.transfer_worker.cancelled.connect(self.on_transfer_cancelled)
+        self.transfer_worker.phase_changed.connect(self.on_transfer_phase_changed)
+        self.transfer_worker.progress_changed.connect(self.on_transfer_progress_changed)
         self.transfer_worker.finished.connect(self.update_send_button_state)
         self.transfer_worker.start()
         self.update_send_button_state()
 
+    def on_transfer_phase_changed(self, phase: str) -> None:
+        if phase == "checking":
+            self.plan_status.setText("正在重新校验源文件……")
+        elif phase == "transferring":
+            self.plan_status.setText("正在上传文件……")
+            self.transfer_progress.setFormat("已上传 %p%")
+        elif phase == "verifying":
+            self.plan_status.setText("上传完成，等待接收端校验和落盘……")
+            self.transfer_progress.setFormat("已上传 100%，等待接收确认")
+            self.cancel_transfer_button.setEnabled(False)
+
+    def on_transfer_progress_changed(self, sent: int) -> None:
+        plan = self.active_transfer_plan
+        if plan is None:
+            return
+        percent = 100 if plan.file_size_bytes == 0 else sent * 100 // plan.file_size_bytes
+        self.transfer_progress.setValue(min(percent, 100))
+        self.transfer_progress.setFormat(f"已上传 {sent:,} / {plan.file_size_bytes:,} 字节（%p%）")
+
+    def cancel_active_transfer(self) -> None:
+        if self.transfer_worker is not None and self.transfer_worker.isRunning():
+            self.transfer_worker.cancel()
+            self.cancel_transfer_button.setEnabled(False)
+            self.plan_status.setText("正在取消传输，等待当前网络操作结束……")
+
+    def refresh_transfer_history(self) -> None:
+        status_labels = {
+            TransferStatus.PREPARING: "检查中",
+            TransferStatus.WAITING_RECEIVER: "等待接收",
+            TransferStatus.TRANSFERRING: "传输中",
+            TransferStatus.VERIFYING: "校验中",
+            TransferStatus.COMPLETED: "完成",
+            TransferStatus.FAILED: "失败或结果未知",
+            TransferStatus.CANCELLED: "已取消",
+            TransferStatus.REJECTED: "已拒绝",
+        }
+        rows = []
+        for record in self.repository.list_records()[:50]:
+            label = status_labels[record.status]
+            task = self.repository.get_task(record.task_id)
+            detail = f"；{task.error_message}" if task and task.error_message else ""
+            rows.append(
+                (
+                    record.started_at or record.finished_at,
+                    f"发出 · {record.file_name}：{label}{detail}",
+                )
+            )
+        for attempt in self.repository.list_incoming_attempts():
+            label = status_labels[attempt.status]
+            detail = f"；{attempt.error_message}" if attempt.error_message else ""
+            rows.append((attempt.created_at, f"接收 · {attempt.file_name}：{label}{detail}"))
+        rows.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC), reverse=True)
+        self.transfer_history.clear()
+        for _timestamp, label in rows[:50]:
+            self.transfer_history.addItem(label)
+
     def on_transfer_succeeded(self, result: dict[str, object]) -> None:
+        self.cancel_transfer_button.setEnabled(False)
+        self.transfer_progress.setValue(100)
+        self.transfer_progress.setFormat("接收端已校验并保存")
         if self.active_transfer_plan is not None:
             self.active_transfer_plan.status = PlanStatus.COMPLETED
-            self.repository.save_plan(self.active_transfer_plan)
+            try:
+                self.repository.save_plan(self.active_transfer_plan)
+            except sqlite3.Error:
+                self.plan_status.setText(
+                    "接收端已确认文件完整，但本机计划状态保存失败；请检查历史后再操作。"
+                )
+                self.active_transfer_plan = None
+                self.refresh_transfer_history()
+                return
             self.active_transfer_plan = None
             self.refresh_plan_list()
+        self.refresh_transfer_history()
         self.plan_status.setText(
             f"发送成功，接收端已校验 SHA-256。文件：{result['file_name']}，"
             f"大小：{result['file_size_bytes']} 字节，SHA-256：{result['sha256']}"
         )
 
     def on_transfer_failed(self, message: str) -> None:
+        self.cancel_transfer_button.setEnabled(False)
+        self.refresh_transfer_history()
         self.plan_status.setText(f"发送失败：{message}")
+        self.active_transfer_plan = None
+
+    def on_transfer_cancelled(self, message: str) -> None:
+        self.cancel_transfer_button.setEnabled(False)
+        self.refresh_transfer_history()
+        self.plan_status.setText(message)
         self.active_transfer_plan = None
 
     def remove_selected_peer(self) -> None:
@@ -911,7 +1089,12 @@ class MainWindow(QMainWindow):
             self.health_worker.wait(3500)
         if self.file_worker and self.file_worker.isRunning():
             self.file_worker.wait()
-        self.node_server.stop()
+        try:
+            self.node_server.stop()
+        except RuntimeError as error:
+            self.local_status.setText(f"本机服务仍在停止：{error}")
+            event.ignore()
+            return
         super().closeEvent(event)
 
 
@@ -921,6 +1104,8 @@ def main() -> int:
     app_data = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     data_dir = app_data / "AI Device Bridge"
     repository = SQLiteRepository(data_dir / "bridge.sqlite3")
+    TransferJournal.reconcile_interrupted(repository)
+    repository.reconcile_incomplete_incoming()
     from ai_device_bridge.infrastructure.tls_identity import load_or_create_tls_identity
 
     identity = load_or_create_tls_identity(data_dir)
@@ -935,6 +1120,7 @@ def main() -> int:
             certificate_pem=identity.certificate_pem,
             receive_token=receive_token,
             receive_directory=data_dir / "Received",
+            repository=repository,
         ),
         repository,
         local_device.device_id,

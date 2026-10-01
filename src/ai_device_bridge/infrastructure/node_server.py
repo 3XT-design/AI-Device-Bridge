@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from pathlib import Path
@@ -9,7 +10,8 @@ from uuid import UUID, uuid4
 
 import uvicorn
 
-from ai_device_bridge.api.health import create_app
+from ai_device_bridge.api.health import STAGING_DIRECTORY_NAME, create_app
+from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 
 
 class NodeServer:
@@ -26,6 +28,7 @@ class NodeServer:
         certificate_pem: str = "",
         receive_token: str = "",
         receive_directory: str | Path = "received",
+        repository: SQLiteRepository | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -36,6 +39,7 @@ class NodeServer:
         self.certificate_pem = certificate_pem
         self.receive_token = receive_token
         self.receive_directory = receive_directory
+        self.repository = repository
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -52,6 +56,8 @@ class NodeServer:
         if not self.certificate_path or not self.private_key_path:
             raise RuntimeError("未配置节点 TLS 证书，拒绝启动明文传输服务。")
 
+        cleanup_orphaned_parts(self.receive_directory)
+
         config = uvicorn.Config(
             create_app(
                 self.device_id,
@@ -59,11 +65,13 @@ class NodeServer:
                 self.certificate_pem,
                 self.receive_token,
                 self.receive_directory,
+                self.repository,
             ),
             host=self.host,
             port=self.port,
             log_level="warning",
             access_log=False,
+            log_config=None,
             ssl_certfile=str(self.certificate_path),
             ssl_keyfile=str(self.private_key_path),
         )
@@ -93,5 +101,27 @@ class NodeServer:
             self._server.should_exit = True
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout_seconds)
+            if self._thread.is_alive():
+                raise RuntimeError("节点服务仍在停止，请稍后重试。")
         self._server = None
         self._thread = None
+
+
+def cleanup_orphaned_parts(receive_directory: str | Path) -> int:
+    """Remove only UUID-named files in the app-owned staging directory."""
+    staging_root = Path(receive_directory) / STAGING_DIRECTORY_NAME
+    if not staging_root.exists():
+        return 0
+    if staging_root.is_symlink() or not staging_root.is_dir():
+        raise RuntimeError("接收暂存目录配置无效。")
+    removed = 0
+    try:
+        for path in staging_root.iterdir():
+            if re.fullmatch(r"[0-9a-f]{32}\.part", path.name) and (
+                path.is_file() or path.is_symlink()
+            ):
+                path.unlink()
+                removed += 1
+    except OSError as error:
+        raise RuntimeError("无法清理上次中断的接收临时文件。") from error
+    return removed

@@ -1,13 +1,18 @@
+import errno
 import hashlib
 import platform
 import socket
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ai_device_bridge import __version__
-from ai_device_bridge.api.health import API_VERSION, create_app
+from ai_device_bridge.api.health import API_VERSION, STAGING_DIRECTORY_NAME, create_app
+from ai_device_bridge.domain.models import TransferStatus
+from ai_device_bridge.infrastructure.node_server import cleanup_orphaned_parts
+from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 from ai_device_bridge.services.peer_health import PeerHealthError, normalize_base_url
 
 
@@ -70,6 +75,54 @@ def test_receive_transfer_requires_token_and_checks_hash(tmp_path) -> None:
     assert (tmp_path / "Inbox" / "report.txt").read_bytes() == content
 
 
+def test_receive_transfer_reports_disk_full_without_publishing(tmp_path, monkeypatch) -> None:
+    token = "example-receiver-token-that-is-long-enough"
+    repository = SQLiteRepository(tmp_path / "history.sqlite3")
+    client = TestClient(
+        create_app(receive_token=token, receive_directory=tmp_path, repository=repository)
+    )
+    content = b"payload"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-File-Name": "report.txt",
+        "X-Target-Directory": "Inbox",
+        "X-File-Size": str(len(content)),
+        "X-File-SHA256": hashlib.sha256(content).hexdigest(),
+    }
+    original_open = Path.open
+
+    def disk_full_on_temporary_file(path, *args, **kwargs):
+        if path.suffix == ".part":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", disk_full_on_temporary_file)
+    response = client.put("/api/v1/transfers", headers=headers, content=content)
+    assert response.status_code == 507
+    assert not list(tmp_path.rglob("*.part"))
+    assert not (tmp_path / "Inbox" / "report.txt").exists()
+    assert repository.list_incoming_attempts()[0].status is TransferStatus.FAILED
+    assert repository.list_incoming_attempts()[0].error_code == "http_507"
+
+
+def test_startup_cleanup_only_removes_bridge_temporary_uploads(tmp_path) -> None:
+    inbox = tmp_path / STAGING_DIRECTORY_NAME
+    inbox.mkdir()
+    orphan = inbox / f"{uuid4().hex}.part"
+    unrelated = inbox / ".notes.part"
+    ordinary_inbox = tmp_path / "Inbox"
+    ordinary_inbox.mkdir()
+    legitimate_file = ordinary_inbox / f".{uuid4().hex}.part"
+    orphan.write_bytes(b"incomplete")
+    unrelated.write_bytes(b"keep")
+    legitimate_file.write_bytes(b"user file")
+
+    assert cleanup_orphaned_parts(tmp_path) == 1
+    assert not orphan.exists()
+    assert unrelated.read_bytes() == b"keep"
+    assert legitimate_file.read_bytes() == b"user file"
+
+
 def test_receive_transfer_rejects_bad_hash_traversal_and_overwrite(tmp_path) -> None:
     token = "example-receiver-token-that-is-long-enough"
     client = TestClient(create_app(receive_token=token, receive_directory=tmp_path))
@@ -98,6 +151,12 @@ def test_receive_transfer_rejects_bad_hash_traversal_and_overwrite(tmp_path) -> 
         content=content,
     )
     assert directory_traversal.status_code == 400
+    staging_directory = client.put(
+        "/api/v1/transfers",
+        headers={**headers, "X-Target-Directory": STAGING_DIRECTORY_NAME},
+        content=content,
+    )
+    assert staging_directory.status_code == 400
 
     correct_headers = {**headers, "X-File-SHA256": hashlib.sha256(content).hexdigest()}
     assert (

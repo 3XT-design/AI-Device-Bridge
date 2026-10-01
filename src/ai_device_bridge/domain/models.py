@@ -26,6 +26,7 @@ class SourceMode(StrEnum):
 
 
 class TransferStatus(StrEnum):
+    PREPARING = "preparing"
     WAITING_RECEIVER = "waiting_receiver"
     REJECTED = "rejected"
     TRANSFERRING = "transferring"
@@ -173,6 +174,12 @@ class TransferTask:
     def transition_to(self, status: TransferStatus) -> None:
         """Apply one permitted transfer-state transition."""
         allowed = {
+            TransferStatus.PREPARING: {
+                TransferStatus.WAITING_RECEIVER,
+                TransferStatus.TRANSFERRING,
+                TransferStatus.CANCELLED,
+                TransferStatus.FAILED,
+            },
             TransferStatus.WAITING_RECEIVER: {
                 TransferStatus.REJECTED,
                 TransferStatus.TRANSFERRING,
@@ -220,6 +227,57 @@ class TransferRecord:
             and self.finished_at < self.started_at
         ):
             raise ValueError("finished_at must not be earlier than started_at")
+
+
+@dataclass(slots=True)
+class IncomingTransferAttempt:
+    """Receiver-side history without inventing an authenticated sender identity."""
+
+    attempt_id: UUID
+    file_name: str
+    target_directory: str
+    file_size_bytes: int
+    expected_sha256: str
+    bytes_received: int
+    status: TransferStatus
+    created_at: datetime
+    updated_at: datetime
+    error_code: str | None = None
+    error_message: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.file_name, "file_name")
+        _require_text(self.target_directory, "target_directory")
+        _require_nonnegative_int(self.file_size_bytes, "file_size_bytes")
+        _require_nonnegative_int(self.bytes_received, "bytes_received")
+        if self.bytes_received > self.file_size_bytes:
+            raise ValueError("bytes_received must not exceed file_size_bytes")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", self.expected_sha256):
+            raise ValueError("expected_sha256 must contain exactly 64 hexadecimal characters")
+        _require_aware_datetime(self.created_at, "created_at")
+        _require_aware_datetime(self.updated_at, "updated_at")
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must not be earlier than created_at")
+        self.expected_sha256 = self.expected_sha256.lower()
+
+    def update_progress(self, bytes_received: int) -> None:
+        if self.status is not TransferStatus.TRANSFERRING:
+            raise ValueError("receiver progress requires an active transfer")
+        _require_nonnegative_int(bytes_received, "bytes_received")
+        if bytes_received < self.bytes_received or bytes_received > self.file_size_bytes:
+            raise ValueError("receiver progress must be monotonic and within the declared size")
+        self.bytes_received = bytes_received
+        self.updated_at = _now_utc()
+
+    def transition_to(self, status: TransferStatus) -> None:
+        allowed = {
+            TransferStatus.TRANSFERRING: {TransferStatus.VERIFYING, TransferStatus.FAILED},
+            TransferStatus.VERIFYING: {TransferStatus.COMPLETED, TransferStatus.FAILED},
+        }
+        if status not in allowed.get(self.status, set()):
+            raise ValueError(f"invalid receiver transition: {self.status} -> {status}")
+        self.status = status
+        self.updated_at = _now_utc()
 
 
 def _require_text(value: str, field_name: str) -> str:

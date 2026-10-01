@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 from ai_device_bridge.domain.models import (
     DeviceProfile,
+    IncomingTransferAttempt,
     PlanStatus,
     SourceMode,
     TransferDirection,
@@ -113,12 +114,29 @@ class SQLiteRepository:
                     finished_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS incoming_transfers (
+                    attempt_id TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    target_directory TEXT NOT NULL,
+                    file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes >= 0),
+                    expected_sha256 TEXT NOT NULL,
+                    bytes_received INTEGER NOT NULL CHECK (bytes_received >= 0),
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error_code TEXT,
+                    error_message TEXT,
+                    CHECK (bytes_received <= file_size_bytes)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_plans_created_at
                     ON plans(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_tasks_created_at
                     ON tasks(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_records_finished_at
                     ON transfer_records(finished_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_incoming_created_at
+                    ON incoming_transfers(created_at DESC);
                 """
             )
             plan_columns = {row["name"] for row in connection.execute("PRAGMA table_info(plans)")}
@@ -415,8 +433,121 @@ class SQLiteRepository:
 
     def save_task(self, task: TransferTask) -> None:
         with self._connection() as connection:
+            _save_task(connection, task)
+
+    def save_transfer_attempt(self, task: TransferTask, record: TransferRecord) -> None:
+        """Commit a task and its history row together so they cannot diverge."""
+        if record.task_id != task.task_id or record.status != task.status:
+            raise ValueError("transfer record must match the task ID and status")
+        with self._connection() as connection:
+            _save_task(connection, task)
+            _save_record(connection, record)
+
+    def list_tasks(self, limit: int = 50) -> list[TransferTask]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def list_incomplete_tasks(self) -> list[TransferTask]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tasks WHERE status IN (?, ?, ?, ?) ORDER BY created_at",
+                (
+                    TransferStatus.PREPARING.value,
+                    TransferStatus.WAITING_RECEIVER.value,
+                    TransferStatus.TRANSFERRING.value,
+                    TransferStatus.VERIFYING.value,
+                ),
+            ).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def get_task(self, task_id: UUID) -> TransferTask | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (str(task_id),)
+            ).fetchone()
+        return None if row is None else _row_to_task(row)
+
+    def save_record(self, record: TransferRecord) -> None:
+        with self._connection() as connection:
+            _save_record(connection, record)
+
+    def get_record_for_task(self, task_id: UUID) -> TransferRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM transfer_records WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+                (str(task_id),),
+            ).fetchone()
+        return None if row is None else _row_to_record(row)
+
+    def list_records(self) -> list[TransferRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM transfer_records ORDER BY rowid DESC"
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
+
+    def save_incoming_attempt(self, attempt: IncomingTransferAttempt) -> None:
+        with self._connection() as connection:
             connection.execute(
-                """INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO incoming_transfers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(attempt_id) DO UPDATE SET
+                     bytes_received=excluded.bytes_received,
+                     status=excluded.status,
+                     updated_at=excluded.updated_at,
+                     error_code=excluded.error_code,
+                     error_message=excluded.error_message""",
+                (
+                    str(attempt.attempt_id),
+                    attempt.file_name,
+                    attempt.target_directory,
+                    attempt.file_size_bytes,
+                    attempt.expected_sha256,
+                    attempt.bytes_received,
+                    attempt.status.value,
+                    _datetime_to_text(attempt.created_at),
+                    _datetime_to_text(attempt.updated_at),
+                    attempt.error_code,
+                    attempt.error_message,
+                ),
+            )
+
+    def list_incoming_attempts(self, limit: int = 50) -> list[IncomingTransferAttempt]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM incoming_transfers ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_incoming_attempt(row) for row in rows]
+
+    def reconcile_incomplete_incoming(self) -> int:
+        """After a process restart, never present an unconfirmed receive as complete."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE incoming_transfers
+                   SET status = ?, error_code = ?, error_message = ?, updated_at = ?
+                   WHERE status IN (?, ?)""",
+                (
+                    TransferStatus.FAILED.value,
+                    "outcome_unknown",
+                    "接收过程被中断；请检查接收目录中的正式文件。",
+                    _datetime_to_text(datetime.now(UTC)),
+                    TransferStatus.TRANSFERRING.value,
+                    TransferStatus.VERIFYING.value,
+                ),
+            )
+            return cursor.rowcount
+
+
+def _save_task(connection: sqlite3.Connection, task: TransferTask) -> None:
+    connection.execute(
+        """INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(task_id) DO UPDATE SET
                      plan_id=excluded.plan_id,
                      sender_device_id=excluded.sender_device_id,
@@ -430,34 +561,27 @@ class SQLiteRepository:
                      updated_at=excluded.updated_at,
                      error_code=excluded.error_code,
                      error_message=excluded.error_message""",
-                (
-                    str(task.task_id),
-                    str(task.plan_id),
-                    str(task.sender_device_id),
-                    str(task.receiver_device_id),
-                    task.file_name,
-                    task.file_size_bytes,
-                    task.expected_sha256.lower(),
-                    task.bytes_transferred,
-                    task.status.value,
-                    _datetime_to_text(task.created_at),
-                    _datetime_to_text(task.updated_at),
-                    task.error_code,
-                    task.error_message,
-                ),
-            )
+        (
+            str(task.task_id),
+            str(task.plan_id),
+            str(task.sender_device_id),
+            str(task.receiver_device_id),
+            task.file_name,
+            task.file_size_bytes,
+            task.expected_sha256.lower(),
+            task.bytes_transferred,
+            task.status.value,
+            _datetime_to_text(task.created_at),
+            _datetime_to_text(task.updated_at),
+            task.error_code,
+            task.error_message,
+        ),
+    )
 
-    def get_task(self, task_id: UUID) -> TransferTask | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM tasks WHERE task_id = ?", (str(task_id),)
-            ).fetchone()
-        return None if row is None else _row_to_task(row)
 
-    def save_record(self, record: TransferRecord) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                """INSERT INTO transfer_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+def _save_record(connection: sqlite3.Connection, record: TransferRecord) -> None:
+    connection.execute(
+        """INSERT INTO transfer_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(record_id) DO UPDATE SET
                      task_id=excluded.task_id,
                      direction=excluded.direction,
@@ -467,25 +591,18 @@ class SQLiteRepository:
                      status=excluded.status,
                      started_at=excluded.started_at,
                      finished_at=excluded.finished_at""",
-                (
-                    str(record.record_id),
-                    str(record.task_id),
-                    record.direction.value,
-                    str(record.peer_device_id),
-                    record.file_name,
-                    record.file_size_bytes,
-                    record.status.value,
-                    _optional_datetime_to_text(record.started_at),
-                    _optional_datetime_to_text(record.finished_at),
-                ),
-            )
-
-    def list_records(self) -> list[TransferRecord]:
-        with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM transfer_records ORDER BY rowid DESC"
-            ).fetchall()
-        return [_row_to_record(row) for row in rows]
+        (
+            str(record.record_id),
+            str(record.task_id),
+            record.direction.value,
+            str(record.peer_device_id),
+            record.file_name,
+            record.file_size_bytes,
+            record.status.value,
+            _optional_datetime_to_text(record.started_at),
+            _optional_datetime_to_text(record.finished_at),
+        ),
+    )
 
 
 def _datetime_to_text(value: datetime) -> str:
@@ -563,4 +680,20 @@ def _row_to_record(row: sqlite3.Row) -> TransferRecord:
         status=TransferStatus(row["status"]),
         started_at=(None if row["started_at"] is None else _text_to_datetime(row["started_at"])),
         finished_at=(None if row["finished_at"] is None else _text_to_datetime(row["finished_at"])),
+    )
+
+
+def _row_to_incoming_attempt(row: sqlite3.Row) -> IncomingTransferAttempt:
+    return IncomingTransferAttempt(
+        attempt_id=UUID(row["attempt_id"]),
+        file_name=row["file_name"],
+        target_directory=row["target_directory"],
+        file_size_bytes=row["file_size_bytes"],
+        expected_sha256=row["expected_sha256"],
+        bytes_received=row["bytes_received"],
+        status=TransferStatus(row["status"]),
+        created_at=_text_to_datetime(row["created_at"]),
+        updated_at=_text_to_datetime(row["updated_at"]),
+        error_code=row["error_code"],
+        error_message=row["error_message"],
     )

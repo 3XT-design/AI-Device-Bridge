@@ -2,8 +2,11 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from ai_device_bridge.domain.models import (
     DeviceProfile,
+    IncomingTransferAttempt,
     PlanStatus,
     SourceMode,
     TransferDirection,
@@ -70,6 +73,104 @@ def test_sqlite_repository_round_trips_core_entities(tmp_path) -> None:
     assert repository.get_plan(plan.plan_id) == plan
     assert repository.get_task(task.task_id) == task
     assert repository.list_records() == [record]
+
+
+def test_transfer_attempt_is_atomic_and_listed_after_restart(tmp_path) -> None:
+    database_path = tmp_path / "bridge.sqlite3"
+    repository = SQLiteRepository(database_path)
+    now = datetime.now(UTC)
+    sender = DeviceProfile(uuid4(), "Sender", "sender-key", "Windows", now)
+    receiver = DeviceProfile(uuid4(), "Receiver", "receiver-key", "Windows", now)
+    repository.save_device(sender)
+    repository.save_device(receiver)
+    plan = TransferPlan(
+        uuid4(),
+        sender.device_id,
+        "C:/report.txt",
+        receiver.device_id,
+        "Inbox",
+        SourceMode.MANUAL,
+        "report.txt",
+        6,
+        PlanStatus.CONFIRMED,
+        now,
+        now + timedelta(minutes=5),
+        "a" * 64,
+    )
+    repository.save_plan(plan)
+    task = TransferTask(
+        uuid4(),
+        plan.plan_id,
+        sender.device_id,
+        receiver.device_id,
+        "report.txt",
+        6,
+        "a" * 64,
+        0,
+        TransferStatus.WAITING_RECEIVER,
+        now,
+        now,
+    )
+    record = TransferRecord(
+        uuid4(),
+        task.task_id,
+        TransferDirection.SENT,
+        uuid4(),
+        "report.txt",
+        6,
+        TransferStatus.WAITING_RECEIVER,
+        now,
+        None,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.save_transfer_attempt(task, record)
+    assert repository.get_task(task.task_id) is None
+
+    record.peer_device_id = receiver.device_id
+    repository.save_transfer_attempt(task, record)
+    restarted = SQLiteRepository(database_path)
+    assert restarted.list_tasks() == [task]
+    assert restarted.list_records() == [record]
+
+
+def test_incoming_history_recovers_incomplete_attempt_without_false_success(tmp_path) -> None:
+    database_path = tmp_path / "bridge.sqlite3"
+    repository = SQLiteRepository(database_path)
+    now = datetime.now(UTC)
+    interrupted = IncomingTransferAttempt(
+        uuid4(),
+        "large.bin",
+        "Inbox",
+        100,
+        "a" * 64,
+        40,
+        TransferStatus.TRANSFERRING,
+        now,
+        now,
+    )
+    completed = IncomingTransferAttempt(
+        uuid4(),
+        "done.bin",
+        "Inbox",
+        2,
+        "b" * 64,
+        2,
+        TransferStatus.COMPLETED,
+        now,
+        now,
+    )
+    repository.save_incoming_attempt(interrupted)
+    repository.save_incoming_attempt(completed)
+
+    restarted = SQLiteRepository(database_path)
+    assert restarted.reconcile_incomplete_incoming() == 1
+    assert restarted.reconcile_incomplete_incoming() == 0
+    records = {row.attempt_id: row for row in restarted.list_incoming_attempts()}
+    assert records[interrupted.attempt_id].status is TransferStatus.FAILED
+    assert records[interrupted.attempt_id].error_code == "outcome_unknown"
+    assert records[interrupted.attempt_id].bytes_received == 40
+    assert records[completed.attempt_id].status is TransferStatus.COMPLETED
 
 
 def test_local_node_id_is_stable_across_repository_restarts(tmp_path) -> None:
