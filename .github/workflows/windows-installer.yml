@@ -1,4 +1,4 @@
-name: Windows release candidate
+name: Windows installer
 
 on:
   push:
@@ -24,45 +24,44 @@ jobs:
           python -m ruff check .
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
-      - name: Build portable package and installer
+      - name: Build Windows installer
         shell: pwsh
         run: ./scripts/build_windows_release.ps1
-      - name: Expand portable ZIP
+      - name: Record installer checksum
         shell: pwsh
         run: |
-          $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
-          try {
-            Expand-Archive ./release/AI-Device-Bridge-portable-windows-x64.zip $portableDir
-          } catch {
-            Write-Host "::error title=Portable ZIP extraction failed::$($_.Exception.Message)"
-            throw
-          }
-      - name: Smoke check portable EXE
+          $checksum = Get-Content ./release/SHA256SUMS.txt
+          Write-Host $checksum
+          Add-Content $env:GITHUB_STEP_SUMMARY '### Installer SHA-256'
+          Add-Content $env:GITHUB_STEP_SUMMARY '```text'
+          Add-Content $env:GITHUB_STEP_SUMMARY $checksum
+          Add-Content $env:GITHUB_STEP_SUMMARY '```'
+      - name: Smoke check packaged EXE
         shell: pwsh
         run: |
-          $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
+          $applicationDir = Join-Path $env:GITHUB_WORKSPACE "build\release-dist\AI Device Bridge"
           $env:AI_DEVICE_BRIDGE_SMOKE_REPORT = Join-Path $env:RUNNER_TEMP "bridge-smoke-report.txt"
           Remove-Item $env:AI_DEVICE_BRIDGE_SMOKE_REPORT -Force -ErrorAction SilentlyContinue
           try {
-            $smoke = Start-Process -FilePath (Join-Path $portableDir "AI Device Bridge.exe") -ArgumentList "--smoke-node" -Wait -PassThru
+            $smoke = Start-Process -FilePath (Join-Path $applicationDir "AI Device Bridge.exe") -ArgumentList "--smoke-node" -Wait -PassThru
           } catch {
-            Write-Host "::error title=Portable EXE launch failed::$($_.Exception.Message)"
+            Write-Host "::error title=Packaged EXE launch failed::$($_.Exception.Message)"
             throw
           }
           if ($smoke.ExitCode -ne 0) {
             $errorFile = $env:AI_DEVICE_BRIDGE_SMOKE_REPORT
             if (Test-Path $errorFile) {
               $lastLine = Get-Content $errorFile | Select-Object -Last 1
-              Write-Host "::error title=Portable smoke error::$lastLine"
-              Add-Content $env:GITHUB_STEP_SUMMARY '### Portable smoke error'
+              Write-Host "::error title=Packaged smoke error::$lastLine"
+              Add-Content $env:GITHUB_STEP_SUMMARY '### Packaged smoke error'
               Add-Content $env:GITHUB_STEP_SUMMARY '```text'
               Get-Content $errorFile | Add-Content $env:GITHUB_STEP_SUMMARY
               Add-Content $env:GITHUB_STEP_SUMMARY '```'
               Get-Content $errorFile
             } else {
-              Write-Host "::error title=Portable smoke error::No traceback file was produced."
+              Write-Host "::error title=Packaged smoke error::No traceback file was produced."
             }
-            throw "Portable node smoke check failed."
+            throw "Packaged node smoke check failed."
           }
       - name: Smoke check installed package
         shell: pwsh
@@ -98,9 +97,8 @@ jobs:
           if (-not (Test-Path $marker)) { throw "Uninstall removed user data." }
       - uses: actions/upload-artifact@v4
         with:
-          name: AI-Device-Bridge-Windows-candidate
+          name: AI-Device-Bridge-Windows-installer
           path: |
-            release/AI-Device-Bridge-portable-windows-x64.zip
             release/AI-Device-Bridge-Setup.exe
             release/SHA256SUMS.txt
           if-no-files-found: error

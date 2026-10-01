@@ -2,11 +2,11 @@
 
 个人设备之间的文件交付工具。当前版本支持设备配对、自然语言查找候选文件、人工审核传输计划，以及通过 HTTPS 发送文件并校验完整性。
 
-## M6 发布验收候选版（0.6.0rc1）
+## v1.0.0 Windows x64
 
-M6 是 v1.0 发布关口，此版本仍是验收候选版。接收端现在只接受已配对设备的专用授权码；两台电脑需要**相互保存配对**。每次发送先提交文件名、大小、目标子目录和 SHA-256，接收电脑弹窗同意后才开始上传正文。拒绝、90 秒超时、轮换授权码或解除配对都会阻止未开始的上传。M5 及更早版本显示的全局接收码不再被正式节点接受；升级后，在接收电脑选中发送设备并复制新的专用码到发送电脑即可。旧数据库、证书、计划和已接收文件保留。
+接收端只接受已配对设备的专用授权码；两台电脑需要**相互保存配对**。每次发送先提交文件名、大小、目标子目录和 SHA-256，接收电脑弹窗同意后才开始上传正文。拒绝、90 秒超时、轮换授权码或解除配对都会阻止未开始的上传。M5 及更早版本显示的全局接收码不再被正式节点接受；升级后，在接收电脑选中发送设备并复制新的专用码到发送电脑即可。旧数据库、证书、计划和已接收文件保留。
 
-服务启动改为后台执行，界面立即显示“正在启动”。Windows 构建脚本会产生便携 ZIP、Inno Setup 安装包及 `SHA256SUMS.txt`；GitHub Actions 另外尝试在 Windows 构建和检查打包后的 TLS 节点。完整发布验收矩阵与待实测项目见 [docs/M6-acceptance.md](docs/M6-acceptance.md)。在两台真实 Windows 电脑完成安装、升级、接收确认、异常场景和 1 GiB 校验前，不标记 v1.0 已发布。
+服务启动在后台执行，界面立即显示“正在启动”。Windows 构建脚本只生成 Inno Setup 安装包及 `SHA256SUMS.txt`；GitHub Actions 在 Windows 构建并检查打包后的 TLS 节点。正式版说明见 [docs/releases/v1.0.0.md](docs/releases/v1.0.0.md)，M6 的自动验收与用户确认的双机验收见 [docs/M6-acceptance.md](docs/M6-acceptance.md)。
 
 ## M5 验收候选版（0.5.0rc2）：易用性与维护
 
@@ -38,7 +38,7 @@ M1-09 补充双节点端到端测试、Windows 可执行文件/安装包构建�
 
 ### 双击启动源码包（Windows）
 
-将源码 ZIP 解压到一个新目录，然后双击解压目录最外层的 `Start-AI-Device-Bridge.bat`。它会自动找到项目，并在 `%LOCALAPPDATA%\AI-Device-Bridge\venv` 创建或复用虚拟环境，避免解压路径较长时 PySide6 安装失败；首次启动时需要已安装的 Python 3.12 或 3.13，并会安装依赖。以后更新版本时，下载并解压新版 ZIP，再双击新版 BAT 即可，不需要修改压缩包名称或 PowerShell 命令。启动期间保留的命令行窗口会显示安装或运行错误。BAT 运行的是源码；M6 发布验收还需单独检查 Windows 安装包。
+开发或排错时，将源码 ZIP 解压到一个新目录，然后双击解压目录最外层的 `Start-AI-Device-Bridge.bat`。它会自动找到项目，并在 `%LOCALAPPDATA%\AI-Device-Bridge\venv` 创建或复用虚拟环境，避免解压路径较长时 PySide6 安装失败；首次启动时需要已安装的 Python 3.12 或 3.13，并会安装依赖。启动期间保留的命令行窗口会显示安装或运行错误。给普通用户分发的是 Windows 安装包。
 
 需要 Python 3.12 或 3.13。要从项目根目录建立开发环境，可在 PowerShell 运行：
 
@@ -55,7 +55,7 @@ python -m pytest -q
 python -m ruff check .
 ```
 
-## 构建 Windows 发布包
+## 构建 Windows 安装包
 
 在 Windows 电脑的项目根目录运行：
 
@@ -64,9 +64,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\build_windows_release.ps1
 ```
 
-脚本会安装 PyInstaller 并生成便携版文件夹和 ZIP，放在 `release` 目录。安装 Inno Setup 6 后再运行同一脚本，还会生成 `AI-Device-Bridge-Setup.exe`，并为实际生成的文件写入 `SHA256SUMS.txt`。安装器以当前用户权限安装，不需要管理员权限。首次运行仍需允许 Windows 防火墙专用网络上的 TCP 8765 入站连接。
+先安装 Inno Setup 6。脚本会使用 PyInstaller 打包应用，再由 Inno Setup 在 `release` 目录生成 `AI-Device-Bridge-Setup.exe` 和对应的 `SHA256SUMS.txt`。安装器以当前用户权限安装，不需要管理员权限。首次运行仍需允许 Windows 防火墙专用网络上的 TCP 8765 入站连接。
 
-升级时关闭应用并运行新版安装器，或解压新版便携包覆盖应用文件。用户数据库、本机 TLS 证书、设备授权码和接收文件保存在 `%APPDATA%\AI Device Bridge`，不会写入安装目录，也不会随卸载删除。升级到 M6 后必须重新复制每台接收设备生成的专用授权码。
+升级时关闭应用并运行新版安装器。用户数据库、本机 TLS 证书、设备授权码和接收文件保存在 `%APPDATA%\AI Device Bridge`，不会写入安装目录，也不会随卸载删除。升级到 M6 后必须重新复制每台接收设备生成的专用授权码。
 
 ## 双机演示流程
 

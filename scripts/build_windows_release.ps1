@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to install release dependencies." }
 
 $DistDirectory = Join-Path $ProjectRoot "build\release-dist"
 $WorkDirectory = Join-Path $ProjectRoot "build\release-work"
-$PortableDirectory = Join-Path $DistDirectory "AI Device Bridge"
+$ApplicationDirectory = Join-Path $DistDirectory "AI Device Bridge"
 Remove-Item $DistDirectory, $WorkDirectory -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
 # PyInstaller's built-in PySide6 hooks collect the Qt libraries and plugins
@@ -59,11 +59,10 @@ New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
     (Join-Path $ProjectRoot "src\ai_device_bridge\__main__.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed to build the Windows application." }
 
-Copy-Item (Join-Path $ProjectRoot "README.md") $PortableDirectory -Force
+Copy-Item (Join-Path $ProjectRoot "README.md") $ApplicationDirectory -Force
 $ReleaseDirectory = Join-Path $ProjectRoot "release"
 New-Item -ItemType Directory -Path $ReleaseDirectory -Force | Out-Null
-$PortableZip = Join-Path $ReleaseDirectory "AI-Device-Bridge-portable-windows-x64.zip"
-Compress-Archive -Path (Join-Path $PortableDirectory "*") -DestinationPath $PortableZip -Force
+Remove-Item (Join-Path $ReleaseDirectory "AI-Device-Bridge-portable-windows-x64.zip") -Force -ErrorAction SilentlyContinue
 
 $IsccPath = $null
 $InstallerPath = Join-Path $ReleaseDirectory "AI-Device-Bridge-Setup.exe"
@@ -84,20 +83,14 @@ if ($IsccCommand) {
     }
 }
 
-if ($IsccPath) {
-    & $IsccPath "/O$ReleaseDirectory" (Join-Path $ProjectRoot "installer\AI-Device-Bridge.iss")
-    if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to create the installer." }
-    if (-not (Test-Path $InstallerPath)) { throw "Installer output was not found." }
-    Write-Host "Installer created in $ReleaseDirectory"
-} else {
-    Write-Warning "Inno Setup 6 was not found; the portable Windows ZIP was created. Install Inno Setup 6 and rerun to create the installer."
+if (-not $IsccPath) {
+    throw "Inno Setup 6 was not found. Install it and rerun to create the Windows installer."
 }
+& $IsccPath "/O$ReleaseDirectory" (Join-Path $ProjectRoot "installer\AI-Device-Bridge.iss")
+if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to create the installer." }
+if (-not (Test-Path $InstallerPath)) { throw "Installer output was not found." }
+Write-Host "Installer created in $ReleaseDirectory"
 
-Write-Host "Portable application package: $PortableZip"
-$Artifacts = @($PortableZip)
-if (Test-Path $InstallerPath) { $Artifacts += $InstallerPath }
-$Checksums = foreach ($Artifact in $Artifacts) {
-    $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$Hash  $(Split-Path $Artifact -Leaf)"
-}
-$Checksums | Set-Content (Join-Path $ReleaseDirectory "SHA256SUMS.txt") -Encoding ascii
+$Hash = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+"$Hash  $(Split-Path $InstallerPath -Leaf)" |
+    Set-Content (Join-Path $ReleaseDirectory "SHA256SUMS.txt") -Encoding ascii
