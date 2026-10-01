@@ -41,6 +41,7 @@ from ai_device_bridge.domain.models import (
 )
 from ai_device_bridge.infrastructure.node_server import NodeServer
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
+from ai_device_bridge.motion_capture import MotionCapturePage
 from ai_device_bridge.services.diagnostics import DiagnosticLog
 from ai_device_bridge.services.file_catalog import (
     FileCandidate,
@@ -546,6 +547,9 @@ class MainWindow(QMainWindow):
         self.update_search_button_state()
         layout.addStretch()
         self._add_page("AI 查找", layout)
+
+        self.motion_page = MotionCapturePage()
+        self.tabs.addTab(self.motion_page, "动作分析")
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("传输历史"))
@@ -1561,6 +1565,10 @@ class MainWindow(QMainWindow):
         self.peer_status.setText(f"连接失败：{message}")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        if not self.motion_page.shutdown():
+            QMessageBox.information(self, "视频分析正在停止", "请稍候再关闭应用。")
+            event.ignore()
+            return
         if self.start_worker and self.start_worker.isRunning():
             QMessageBox.information(self, "本机服务正在启动", "请稍候再关闭应用。")
             event.ignore()

@@ -43,7 +43,7 @@ def test_reviewed_candidate_creates_traceable_ai_plan_without_sending(
         SimpleNamespace(stop=lambda: None), repository, local.device_id, "fingerprint", "token"
     )
     assert [window.tabs.tabText(index) for index in range(window.tabs.count())] == [
-        "设备与配对", "发送文件", "AI 查找", "历史与诊断",
+        "设备与配对", "发送文件", "AI 查找", "动作分析", "历史与诊断",
     ]
     window.tabs.setCurrentIndex(2)
     window.file_query.setText(request)
@@ -107,7 +107,7 @@ def test_m5_guidance_search_and_copied_diagnostics(tmp_path, monkeypatch) -> Non
     assert f"数据库版本：{SCHEMA_VERSION}" in copied
     window.tabs.setCurrentIndex(1)
     window.plan_filter.setText("report")
-    window.tabs.setCurrentIndex(3)
+    window.tabs.setCurrentIndex(4)
     window.tabs.setCurrentIndex(1)
     assert window.plan_filter.text() == "report"
     window.choose_peer_tab_button.click()

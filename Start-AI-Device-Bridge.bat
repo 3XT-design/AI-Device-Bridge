@@ -19,22 +19,18 @@ if not exist "%VENV_PY%" (
     echo Creating Python environment with Python 3.12...
     py -3.12 -m venv "%VENV_DIR%" >nul 2>&1
     if not exist "%VENV_PY%" (
-        echo Trying Python 3.13...
-        py -3.13 -m venv "%VENV_DIR%" >nul 2>&1
-    )
-    if not exist "%VENV_PY%" (
         echo Trying the default Python installation...
-        python -c "import sys; assert sys.version_info.major == 3 and sys.version_info.minor in [12, 13]" >nul 2>&1
+        python -c "import sys; assert sys.version_info[:2] == (3, 12)" >nul 2>&1
         if not errorlevel 1 python -m venv "%VENV_DIR%"
     )
 )
 
 if not exist "%VENV_PY%" (
-    echo Python 3.12 or 3.13 is required. Install it, then run this file again.
+    echo Python 3.12 is required for M7. Install it, then run this file again.
     goto :failed
 )
 
-"%VENV_PY%" -c "import sys; assert sys.version_info.major == 3 and sys.version_info.minor in [12, 13]"
+"%VENV_PY%" -c "import sys; assert sys.version_info[:2] == (3, 12)"
 if errorlevel 1 (
     echo The existing virtual environment uses an unsupported Python version.
     echo Rename "%VENV_DIR%", then run this file again.

@@ -7,15 +7,15 @@ from pathlib import Path
 from tempfile import gettempdir
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--smoke-node"]:
+    if sys.argv[1:] in (["--smoke-node"], ["--smoke-motion"]):
         report = Path(os.environ.get(
             "AI_DEVICE_BRIDGE_SMOKE_REPORT",
             str(Path(gettempdir()) / "ai-device-bridge-smoke-error.txt"),
         ))
         try:
-            from ai_device_bridge.services.smoke import run_node_smoke
+            from ai_device_bridge.services.smoke import run_motion_smoke, run_node_smoke
 
-            result = run_node_smoke()
+            result = run_motion_smoke() if sys.argv[1] == "--smoke-motion" else run_node_smoke()
         except BaseException:
             report.write_text(traceback.format_exc(), encoding="utf-8")
             result = 1

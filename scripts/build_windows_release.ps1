@@ -55,6 +55,7 @@ New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
     --collect-all pydantic `
     --collect-all pydantic_core `
     --collect-all starlette `
+    --collect-all mediapipe `
     --collect-submodules ai_device_bridge `
     (Join-Path $ProjectRoot "src\ai_device_bridge\__main__.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed to build the Windows application." }
