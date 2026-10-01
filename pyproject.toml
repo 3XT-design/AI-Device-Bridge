@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-device-bridge"
-version = "0.3.0rc1"
+version = "0.4.0rc1"
 description = "AI-assisted file delivery between personal devices"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"

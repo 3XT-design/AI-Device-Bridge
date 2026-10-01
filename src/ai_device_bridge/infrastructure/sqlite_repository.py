@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from ai_device_bridge.domain.models import (
+    AIPlanEvidence,
     DeviceProfile,
     IncomingTransferAttempt,
     PlanStatus,
@@ -83,6 +85,15 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     expected_sha256 TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_plan_evidence (
+                    plan_id TEXT PRIMARY KEY REFERENCES plans(plan_id),
+                    request_text TEXT NOT NULL,
+                    authorized_root TEXT NOT NULL,
+                    candidates_json TEXT NOT NULL,
+                    selected_candidate_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -384,26 +395,50 @@ class SQLiteRepository:
 
     def save_plan(self, plan: TransferPlan) -> None:
         with self._connection() as connection:
+            _upsert_plan(connection, plan)
+
+    def save_ai_plan(self, plan: TransferPlan, evidence: AIPlanEvidence) -> None:
+        """Persist a reviewed AI plan and its metadata-only provenance atomically."""
+        if plan.source_mode is not SourceMode.NATURAL_LANGUAGE or plan.plan_id != evidence.plan_id:
+            raise ValueError("AI evidence must belong to a natural-language plan")
+        with self._connection() as connection:
+            _upsert_plan(connection, plan)
             connection.execute(
-                """INSERT INTO plans (
-                       plan_id, source_device_id, source_path, target_device_id,
-                       target_directory, source_mode, file_name, file_size_bytes,
-                       status, created_at, expires_at, expected_sha256
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO ai_plan_evidence (
+                       plan_id, request_text, authorized_root, candidates_json,
+                       selected_candidate_id, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(plan_id) DO UPDATE SET
-                     source_device_id=excluded.source_device_id,
-                     source_path=excluded.source_path,
-                     target_device_id=excluded.target_device_id,
-                     target_directory=excluded.target_directory,
-                     source_mode=excluded.source_mode,
-                     file_name=excluded.file_name,
-                     file_size_bytes=excluded.file_size_bytes,
-                     status=excluded.status,
-                     created_at=excluded.created_at,
-                     expires_at=excluded.expires_at,
-                     expected_sha256=excluded.expected_sha256""",
-                _plan_to_values(plan),
+                     request_text=excluded.request_text,
+                     authorized_root=excluded.authorized_root,
+                     candidates_json=excluded.candidates_json,
+                     selected_candidate_id=excluded.selected_candidate_id,
+                     created_at=excluded.created_at""",
+                (
+                    str(evidence.plan_id),
+                    evidence.request_text,
+                    evidence.authorized_root,
+                    json.dumps(evidence.candidates, ensure_ascii=False),
+                    evidence.selected_candidate_id,
+                    _datetime_to_text(evidence.created_at),
+                ),
             )
+
+    def get_ai_plan_evidence(self, plan_id: UUID) -> AIPlanEvidence | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_plan_evidence WHERE plan_id = ?", (str(plan_id),)
+            ).fetchone()
+        if row is None:
+            return None
+        return AIPlanEvidence(
+            plan_id=UUID(row["plan_id"]),
+            request_text=row["request_text"],
+            authorized_root=row["authorized_root"],
+            candidates=tuple(tuple(item) for item in json.loads(row["candidates_json"])),
+            selected_candidate_id=row["selected_candidate_id"],
+            created_at=_text_to_datetime(row["created_at"]),
+        )
 
     def get_plan(self, plan_id: UUID) -> TransferPlan | None:
         with self._connection() as connection:
@@ -615,6 +650,29 @@ def _optional_datetime_to_text(value: datetime | None) -> str | None:
 
 def _text_to_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _upsert_plan(connection: sqlite3.Connection, plan: TransferPlan) -> None:
+    connection.execute(
+        """INSERT INTO plans (
+               plan_id, source_device_id, source_path, target_device_id,
+               target_directory, source_mode, file_name, file_size_bytes,
+               status, created_at, expires_at, expected_sha256
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(plan_id) DO UPDATE SET
+             source_device_id=excluded.source_device_id,
+             source_path=excluded.source_path,
+             target_device_id=excluded.target_device_id,
+             target_directory=excluded.target_directory,
+             source_mode=excluded.source_mode,
+             file_name=excluded.file_name,
+             file_size_bytes=excluded.file_size_bytes,
+             status=excluded.status,
+             created_at=excluded.created_at,
+             expires_at=excluded.expires_at,
+             expected_sha256=excluded.expected_sha256""",
+        _plan_to_values(plan),
+    )
 
 
 def _plan_to_values(plan: TransferPlan) -> tuple[object, ...]:

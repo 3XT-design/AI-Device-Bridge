@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from ai_device_bridge import __version__
 from ai_device_bridge.api.health import HealthResponse
 from ai_device_bridge.domain.models import (
+    AIPlanEvidence,
     DeviceProfile,
     PlanStatus,
     SourceMode,
@@ -40,13 +41,16 @@ from ai_device_bridge.domain.models import (
 from ai_device_bridge.infrastructure.node_server import NodeServer
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 from ai_device_bridge.services.file_catalog import (
-    CandidateSearchResult,
+    FileCandidate,
     FileCatalogError,
-    discover_files,
-    rank_candidates_with_ollama,
 )
 from ai_device_bridge.services.file_inspection import FileInspection, inspect_file
 from ai_device_bridge.services.file_transfer import FileTransferError, TransferCancelled, send_file
+from ai_device_bridge.services.intent_planning import (
+    IntentSearchResult,
+    is_safe_relative_directory,
+    search_intent,
+)
 from ai_device_bridge.services.peer_health import PeerHealthError, check_peer_health
 from ai_device_bridge.services.transfer_journal import TransferJournal
 
@@ -182,23 +186,27 @@ class FileTransferWorker(QThread):
 
 
 class FileSearchWorker(QThread):
-    """Discover files in an authorized folder and ask Ollama to rank candidates."""
+    """Build a constrained intent draft without blocking the desktop interface."""
 
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, root: str, query: str, ollama_url: str, model: str) -> None:
+    def __init__(
+        self, root: str, query: str, peer_names: tuple[str, ...], ollama_url: str, model: str
+    ) -> None:
         super().__init__()
         self.root = root
         self.query = query
+        self.peer_names = peer_names
         self.ollama_url = ollama_url
         self.model = model
 
     def run(self) -> None:
         try:
-            files = discover_files(self.root)
             self.succeeded.emit(
-                rank_candidates_with_ollama(self.query, files, self.ollama_url, self.model)
+                search_intent(
+                    self.root, self.query, self.peer_names, self.ollama_url, self.model
+                )
             )
         except FileCatalogError as error:
             self.failed.emit(str(error))
@@ -229,6 +237,8 @@ class MainWindow(QMainWindow):
         self.search_worker: FileSearchWorker | None = None
         self.active_transfer_plan: TransferPlan | None = None
         self.pending_ai_candidate_plan = False
+        self.pending_ai_candidate: tuple[IntentSearchResult, FileCandidate] | None = None
+        self.search_result: IntentSearchResult | None = None
         self.last_checked_peer: HealthResponse | None = None
         self.inspected_file: FileInspection | None = None
         self.selected_peer_id: UUID | None = None
@@ -237,7 +247,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("AI Device Bridge")
         title.setObjectName("projectTitle")
-        intro = QLabel("M1-08 AI 文件检索与计划准备；确认后通过 HTTPS 传输并校验 SHA-256。")
+        intro = QLabel("M4 可审核 AI 计划；确认后通过 HTTPS 传输并校验 SHA-256。")
         intro.setWordWrap(True)
 
         self.local_status = QLabel("本机节点服务未启动")
@@ -420,7 +430,7 @@ class MainWindow(QMainWindow):
         model_controls.addWidget(self.ollama_url, 1)
         model_controls.addWidget(QLabel("模型"))
         model_controls.addWidget(self.ollama_model)
-        layout.addWidget(QLabel("AI 文件检索与计划准备（M1-08）"))
+        layout.addWidget(QLabel("AI 文件、设备与目录意图计划（M4）"))
         layout.addLayout(root_controls)
         layout.addLayout(model_controls)
         layout.addWidget(self.file_query)
@@ -436,7 +446,7 @@ class MainWindow(QMainWindow):
                 self.candidate_list.currentItem() is not None
             )
         )
-        self.file_query.textChanged.connect(self.update_search_button_state)
+        self.file_query.textChanged.connect(self.invalidate_search_results)
         self.update_search_button_state()
 
     def choose_authorized_root(self) -> None:
@@ -447,7 +457,15 @@ class MainWindow(QMainWindow):
         self.authorized_root.setText(str(root))
         self.repository.save_setting("authorized_root", str(root))
         self.candidate_list.clear()
+        self.search_result = None
         self.candidate_status.setText(f"本次授权目录：{root}。仅检索此文件夹及其子文件夹。")
+        self.update_search_button_state()
+
+    def invalidate_search_results(self, _text: str) -> None:
+        self.search_result = None
+        self.candidate_list.clear()
+        self.use_candidate_button.setEnabled(False)
+        self.candidate_status.setText("描述已更改，请重新检索并审核候选。")
         self.update_search_button_state()
 
     def update_search_button_state(self) -> None:
@@ -478,48 +496,106 @@ class MainWindow(QMainWindow):
             self.candidate_status.setText(f"保存检索设置失败：{error}")
             return
         self.candidate_list.clear()
+        self.search_result = None
         self.use_candidate_button.setEnabled(False)
         self.search_files_button.setEnabled(False)
         self.candidate_status.setText(
             "正在扫描授权目录并请求 Ollama 匹配候选文件……不会读取文件内容。"
         )
-        self.search_worker = FileSearchWorker(root, query, ollama_url, model)
+        peer_names = tuple(
+            peer.device_name for peer in self.repository.list_paired_devices()
+            if peer.device_id != self.local_device_id
+        )
+        self.search_worker = FileSearchWorker(root, query, peer_names, ollama_url, model)
         self.search_worker.succeeded.connect(self.on_file_search_succeeded)
         self.search_worker.failed.connect(self.on_file_search_failed)
         self.search_worker.finished.connect(self.update_search_button_state)
         self.search_worker.start()
 
-    def on_file_search_succeeded(self, result: CandidateSearchResult) -> None:
+    def on_file_search_succeeded(self, result: IntentSearchResult) -> None:
+        if (
+            result.request_text != self.file_query.text().strip()
+            or result.authorized_root != str(Path(self.authorized_root.text()).resolve())
+        ):
+            self.candidate_status.setText("检索期间描述或授权目录已更改，请重新检索。")
+            return
+        self.search_result = result
         self.candidate_list.clear()
+        self.selected_peer_id = None
+        self.peer_list.setCurrentRow(-1)
+        self.peer_token.clear()
+        self.save_peer_token_button.setEnabled(False)
+        if result.intent.target_device_name:
+            for index in range(self.peer_list.count()):
+                peer_item = self.peer_list.item(index)
+                device = self.repository.get_device(
+                    UUID(peer_item.data(Qt.ItemDataRole.UserRole))
+                )
+                if device and device.device_name == result.intent.target_device_name:
+                    self.peer_list.setCurrentItem(peer_item)
+                    self.select_peer(peer_item)
+                    break
         for candidate in result.candidates:
             modified = candidate.modified_at.astimezone().strftime("%Y-%m-%d %H:%M")
             item = QListWidgetItem(
                 f"{candidate.relative_path} · {candidate.file_size_bytes} B · {modified}"
             )
-            item.setData(Qt.ItemDataRole.UserRole, candidate.path)
+            item.setData(Qt.ItemDataRole.UserRole, candidate.candidate_id)
             self.candidate_list.addItem(item)
         count = self.candidate_list.count()
-        status = f"Ollama 返回 {count} 个候选。请选择文件，再载入并确认计划。"
+        source = "Ollama 排序" if result.ranking_source == "ollama" else "本地匹配"
+        status = f"{source}返回 {count} 个候选。请选择文件，再审核设备、目录和计划。"
+        if result.intent.target_device_name:
+            status += f"\n描述中的设备：{result.intent.target_device_name}（需从已配对列表核对）。"
+        if result.intent.target_directory_name:
+            self.target_directory.setText(result.intent.target_directory_name)
+            status += (
+                f"\n建议接收子目录：Received/{result.intent.target_directory_name}，"
+                "请确认或修改。"
+            )
         if result.clarification:
             status += f"\n需要确认：{result.clarification}"
-        if count == 0 and not result.clarification:
-            status += "请调整描述后重试。"
         self.candidate_status.setText(status)
         self.use_candidate_button.setEnabled(False)
 
     def on_file_search_failed(self, message: str) -> None:
+        self.search_result = None
         self.candidate_status.setText(f"AI 文件检索失败：{message}")
         self.use_candidate_button.setEnabled(False)
 
     def use_selected_candidate(self) -> None:
         item = self.candidate_list.currentItem()
-        if item is None:
+        result = self.search_result
+        if item is None or result is None:
             self.candidate_status.setText("请先选择一个候选文件。")
             return
-        root = Path(self.authorized_root.text()).expanduser().resolve()
-        candidate_path = Path(item.data(Qt.ItemDataRole.UserRole)).resolve()
+        if (
+            result.request_text != self.file_query.text().strip()
+            or result.authorized_root != str(Path(self.authorized_root.text()).resolve())
+        ):
+            self.candidate_status.setText("描述或授权目录已变化，请重新检索。")
+            return
+        candidate = next(
+            (value for value in result.candidates
+             if value.candidate_id == item.data(Qt.ItemDataRole.UserRole)), None
+        )
+        if candidate is None:
+            self.candidate_status.setText("候选已过期，请重新检索。")
+            return
+        root = Path(result.authorized_root)
+        try:
+            candidate_path = Path(candidate.path).resolve(strict=True)
+            stat = candidate_path.stat()
+        except (OSError, RuntimeError):
+            self.candidate_status.setText("候选文件已不存在，请重新检索。")
+            return
         if not candidate_path.is_relative_to(root) or not candidate_path.is_file():
             self.candidate_status.setText("候选文件已移出授权目录或不存在，请重新检索。")
+            return
+        if stat.st_size != candidate.file_size_bytes or abs(
+            stat.st_mtime - candidate.modified_at.timestamp()
+        ) > 0.001:
+            self.candidate_status.setText("候选文件在检索后发生变化，请重新检索。")
             return
         if self.selected_peer_id is None:
             QMessageBox.information(
@@ -528,13 +604,24 @@ class MainWindow(QMainWindow):
                 "请先在已配对设备列表中选择接收设备，再载入候选文件。",
             )
             return
-        peer = self.repository.get_device(self.selected_peer_id)
+        peer = next(
+            (value for value in self.repository.list_paired_devices()
+             if value.device_id == self.selected_peer_id), None
+        )
         if peer is None:
             self.candidate_status.setText("所选接收设备已解除配对，请重新选择设备。")
+            return
+        expected_peer = result.intent.target_device_name
+        if expected_peer and peer.device_name != expected_peer:
+            self.candidate_status.setText(
+                f"描述指定“{expected_peer}”，当前选中“{peer.device_name}”；"
+                "请重新选择设备或修改描述并检索。"
+            )
             return
         if self.file_worker and self.file_worker.isRunning():
             return
         self.pending_ai_candidate_plan = True
+        self.pending_ai_candidate = (result, candidate)
         self.inspected_file = None
         self.file_status.setText("正在读取候选文件并计算 SHA-256……")
         self.file_hash.setText("SHA-256：计算中")
@@ -683,6 +770,7 @@ class MainWindow(QMainWindow):
         if self.file_worker and self.file_worker.isRunning():
             return
         self.pending_ai_candidate_plan = False
+        self.pending_ai_candidate = None
         self.inspected_file = None
         self.file_status.setText("正在计算 SHA-256……")
         self.file_hash.setText("SHA-256：计算中")
@@ -707,9 +795,11 @@ class MainWindow(QMainWindow):
         if self.pending_ai_candidate_plan:
             self.pending_ai_candidate_plan = False
             self.create_transfer_plan(from_ai_candidate=True)
+            self.pending_ai_candidate = None
 
     def on_file_inspection_failed(self, message: str) -> None:
         self.pending_ai_candidate_plan = False
+        self.pending_ai_candidate = None
         self.inspected_file = None
         self.file_status.setText(f"文件读取失败：{message}")
         self.file_hash.setText("SHA-256：—")
@@ -730,17 +820,45 @@ class MainWindow(QMainWindow):
         source = self.inspected_file
         target_id = self.selected_peer_id
         target_directory = self.target_directory.text().strip()
+        ai_choice = self.pending_ai_candidate if from_ai_candidate else None
         if source is None or target_id is None:
             self.plan_status.setText("请先选择文件，并在已配对设备列表中选择接收设备。")
             return
-        if not target_directory:
-            self.plan_status.setText("请填写接收端目标目录。")
+        if not is_safe_relative_directory(target_directory):
+            self.plan_status.setText("请填写 Received 下有效的相对目标目录。")
             return
-        target = self.repository.get_device(target_id)
+        target = next(
+            (value for value in self.repository.list_paired_devices()
+             if value.device_id == target_id), None
+        )
         if target is None:
             self.plan_status.setText("所选设备已解除配对，请重新选择设备。")
             self.refresh_peer_list()
             return
+        if from_ai_candidate:
+            if ai_choice is None:
+                self.plan_status.setText("AI 候选已失效，请重新检索。")
+                return
+            result, candidate = ai_choice
+            try:
+                current_source_path = Path(source.path).resolve(strict=True)
+            except (OSError, RuntimeError):
+                self.plan_status.setText("AI 候选文件已不存在，请重新检索。")
+                return
+            if (
+                result.request_text != self.file_query.text().strip()
+                or result.authorized_root != str(Path(self.authorized_root.text()).resolve())
+                or source.path != candidate.path
+                or not current_source_path.is_relative_to(result.authorized_root)
+            ):
+                self.plan_status.setText("检索条件或候选文件已变化，请重新检索。")
+                return
+            if (
+                result.intent.target_device_name
+                and target.device_name != result.intent.target_device_name
+            ):
+                self.plan_status.setText("所选设备与描述不符，请重新选择或重新检索。")
+                return
         prompt_text = (
             "将此文件加入最近传输计划？确认后计划会显示在列表中，但不会自动发送。"
             if from_ai_candidate
@@ -751,7 +869,14 @@ class MainWindow(QMainWindow):
             "载入最近传输计划" if from_ai_candidate else "确认传输计划",
             f"文件：{source.file_name}\n大小：{source.file_size_bytes} 字节\n"
             f"SHA-256：{source.sha256}\n接收设备：{target.device_name}\n"
-            f"目标目录：{target_directory}\n\n{prompt_text}",
+            f"接收位置：Received/{target_directory}\n"
+            + (
+                f"原始描述：{ai_choice[0].request_text}\n"
+                f"授权目录：{ai_choice[0].authorized_root}\n"
+                f"人工选择：{ai_choice[1].candidate_id} · {ai_choice[1].relative_path}\n"
+                if ai_choice else ""
+            )
+            + f"\n{prompt_text}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -766,7 +891,9 @@ class MainWindow(QMainWindow):
             source_path=source.path,
             target_device_id=target_id,
             target_directory=target_directory,
-            source_mode=SourceMode.MANUAL,
+            source_mode=(
+                SourceMode.NATURAL_LANGUAGE if from_ai_candidate else SourceMode.MANUAL
+            ),
             file_name=source.file_name,
             file_size_bytes=source.file_size_bytes,
             status=PlanStatus.CONFIRMED,
@@ -775,8 +902,24 @@ class MainWindow(QMainWindow):
             expected_sha256=source.sha256,
         )
         try:
-            self.repository.save_plan(plan)
-        except sqlite3.Error as error:
+            if ai_choice:
+                result, candidate = ai_choice
+                self.repository.save_ai_plan(
+                    plan,
+                    AIPlanEvidence(
+                        plan_id=plan.plan_id,
+                        request_text=result.request_text,
+                        authorized_root=result.authorized_root,
+                        candidates=tuple(
+                            (item.candidate_id, item.relative_path) for item in result.considered
+                        ),
+                        selected_candidate_id=candidate.candidate_id,
+                        created_at=now,
+                    ),
+                )
+            else:
+                self.repository.save_plan(plan)
+        except (sqlite3.Error, ValueError) as error:
             self.plan_status.setText(f"计划保存失败：{error}")
             return
         self.refresh_plan_list()
@@ -787,13 +930,25 @@ class MainWindow(QMainWindow):
         for plan in self.repository.list_plans(limit=20):
             target = self.repository.get_device(plan.target_device_id)
             target_name = target.device_name if target else str(plan.target_device_id)
+            source_label = "AI" if plan.source_mode is SourceMode.NATURAL_LANGUAGE else "手动"
             self.plan_list.addItem(
-                f"{plan.file_name} → {target_name} · {plan.status.value} · "
+                f"[{source_label}] {plan.file_name} → {target_name} · {plan.status.value} · "
                 f"{plan.file_size_bytes} B · SHA-256 {plan.expected_sha256[:12]}…"
             )
-            self.plan_list.item(self.plan_list.count() - 1).setData(
-                Qt.ItemDataRole.UserRole, str(plan.plan_id)
-            )
+            plan_item = self.plan_list.item(self.plan_list.count() - 1)
+            plan_item.setData(Qt.ItemDataRole.UserRole, str(plan.plan_id))
+            if plan.source_mode is SourceMode.NATURAL_LANGUAGE:
+                evidence = self.repository.get_ai_plan_evidence(plan.plan_id)
+                if evidence:
+                    selected_path = next(
+                        (path for candidate_id, path in evidence.candidates
+                         if candidate_id == evidence.selected_candidate_id),
+                        "候选记录缺失",
+                    )
+                    plan_item.setToolTip(
+                        f"原始描述：{evidence.request_text}\n"
+                        f"人工选择：{evidence.selected_candidate_id} · {selected_path}"
+                    )
         self.update_send_button_state()
 
     def delete_selected_plan(self) -> None:
@@ -913,6 +1068,20 @@ class MainWindow(QMainWindow):
             self.refresh_plan_list()
             self.plan_status.setText("该计划已过期，请重新选择文件并确认计划。")
             return
+        if plan.source_mode is SourceMode.NATURAL_LANGUAGE:
+            evidence = self.repository.get_ai_plan_evidence(plan.plan_id)
+            if evidence is None:
+                self.plan_status.setText("AI 计划缺少候选审核记录，请重新检索并建立计划。")
+                return
+            try:
+                source_path = Path(plan.source_path).resolve(strict=True)
+                root_path = Path(evidence.authorized_root).resolve(strict=True)
+            except (OSError, RuntimeError):
+                self.plan_status.setText("AI 计划的授权目录或源文件已不存在，请重新检索。")
+                return
+            if not source_path.is_relative_to(root_path) or not source_path.is_file():
+                self.plan_status.setText("AI 计划的源文件已离开授权目录，禁止发送。")
+                return
         address = self.repository.get_peer_address(plan.target_device_id)
         token, certificate_pem = self.repository.get_peer_security(plan.target_device_id)
         if not address or not token or not certificate_pem:

@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from ai_device_bridge.domain.models import (
+    AIPlanEvidence,
     DeviceProfile,
     IncomingTransferAttempt,
     PlanStatus,
@@ -288,7 +289,41 @@ def test_repository_migrates_existing_plan_table_for_file_hash(tmp_path) -> None
 
     with sqlite3.connect(database_path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(plans)")}
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
     assert "expected_sha256" in columns
+    assert "ai_plan_evidence" in tables
+
+
+def test_ai_plan_evidence_survives_restart_and_hidden_plan(tmp_path) -> None:
+    database_path = tmp_path / "bridge.sqlite3"
+    repository = SQLiteRepository(database_path)
+    now = datetime.now(UTC)
+    sender = DeviceProfile(uuid4(), "Laptop", "sender", "Windows", now)
+    receiver = DeviceProfile(uuid4(), "Desktop", "receiver", "Windows", now)
+    repository.save_device(sender)
+    repository.save_peer(receiver, "192.168.1.20:8765")
+    plan = TransferPlan(
+        uuid4(), sender.device_id, "C:/allowed/report.pdf", receiver.device_id,
+        "Inbox", SourceMode.NATURAL_LANGUAGE, "report.pdf", 12, PlanStatus.CONFIRMED,
+        now, now + timedelta(minutes=15), "a" * 64,
+    )
+    evidence = AIPlanEvidence(
+        plan.plan_id, "找上周的报告", "C:/allowed",
+        (("F00001", "report.pdf"), ("F00002", "other-report.pdf")), "F00001", now,
+    )
+    repository.save_ai_plan(plan, evidence)
+
+    restarted = SQLiteRepository(database_path)
+    assert restarted.get_plan(plan.plan_id) == plan
+    assert restarted.get_ai_plan_evidence(plan.plan_id) == evidence
+    assert restarted.delete_plan(plan.plan_id)
+    assert restarted.get_ai_plan_evidence(plan.plan_id) == evidence
+
+    with pytest.raises(ValueError, match="natural-language"):
+        plan.source_mode = SourceMode.MANUAL
+        repository.save_ai_plan(plan, evidence)
 
 
 def test_delete_plan_hides_from_recent_list_and_preserves_transfer_history(tmp_path) -> None:

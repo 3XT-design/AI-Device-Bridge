@@ -12,12 +12,14 @@ if ($LASTEXITCODE -ne 0) {
     throw "Python 3.12 was not found. Install Python 3.12 and try again."
 }
 
-if (-not (Test-Path ".venv\Scripts\python.exe")) {
-    py -3.12 -m venv .venv
+$VenvDir = Join-Path $env:LOCALAPPDATA "AI-Device-Bridge\release-venv"
+$Python = Join-Path $VenvDir "Scripts\python.exe"
+if (-not (Test-Path $Python)) {
+    py -3.12 -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the virtual environment." }
 }
 
-$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+# Keep PySide6's deep package paths out of a potentially nested source ZIP directory.
 & $Python -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade pip." }
 & $Python -m pip install -e ".[release]"

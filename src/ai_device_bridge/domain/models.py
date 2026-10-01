@@ -130,6 +130,30 @@ class TransferPlan:
         self.expected_sha256 = self.expected_sha256.lower()
 
 
+@dataclass(frozen=True, slots=True)
+class AIPlanEvidence:
+    """Metadata-only trail from an authorized search to one human-selected candidate."""
+
+    plan_id: UUID
+    request_text: str
+    authorized_root: str
+    candidates: tuple[tuple[str, str], ...]
+    selected_candidate_id: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_text(self.request_text, "request_text")
+        _require_text(self.authorized_root, "authorized_root")
+        _require_text(self.selected_candidate_id, "selected_candidate_id")
+        _require_aware_datetime(self.created_at, "created_at")
+        ids = [candidate_id for candidate_id, _path in self.candidates]
+        if len(ids) != len(set(ids)) or self.selected_candidate_id not in ids:
+            raise ValueError("selected candidate must occur exactly once in the search snapshot")
+        for candidate_id, relative_path in self.candidates:
+            _require_text(candidate_id, "candidate_id")
+            _require_text(relative_path, "relative_path")
+
+
 @dataclass(slots=True)
 class TransferTask:
     task_id: UUID
