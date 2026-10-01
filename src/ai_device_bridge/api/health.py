@@ -118,7 +118,7 @@ def create_app(
         sender = authorized_sender(authorization)
         if not repository.cancel_receive_request(request_id, sender):
             raise HTTPException(status_code=404, detail="待确认接收请求不存在。")
-        return {"status": "rejected"}
+        return {"status": "cancelled"}
 
     @app.put("/api/v1/transfers")
     @app.put("/api/v1/transfers/{request_id}")
