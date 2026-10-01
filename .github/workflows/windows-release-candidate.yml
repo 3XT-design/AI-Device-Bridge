@@ -41,6 +41,8 @@ jobs:
         shell: pwsh
         run: |
           $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
+          $env:AI_DEVICE_BRIDGE_SMOKE_REPORT = Join-Path $env:RUNNER_TEMP "bridge-smoke-report.txt"
+          Remove-Item $env:AI_DEVICE_BRIDGE_SMOKE_REPORT -Force -ErrorAction SilentlyContinue
           try {
             & (Join-Path $portableDir "AI Device Bridge.exe") --smoke-node
           } catch {
@@ -48,7 +50,7 @@ jobs:
             throw
           }
           if ($LASTEXITCODE -ne 0) {
-            $errorFile = Join-Path $env:TEMP "ai-device-bridge-smoke-error.txt"
+            $errorFile = $env:AI_DEVICE_BRIDGE_SMOKE_REPORT
             if (Test-Path $errorFile) {
               $lastLine = Get-Content $errorFile | Select-Object -Last 1
               Write-Host "::error title=Portable smoke error::$lastLine"
@@ -69,9 +71,11 @@ jobs:
           $installDir = Join-Path $env:RUNNER_TEMP "Bridge Installed"
           & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
           if ($LASTEXITCODE -ne 0) { throw "Silent install failed." }
+          $env:AI_DEVICE_BRIDGE_SMOKE_REPORT = Join-Path $env:RUNNER_TEMP "bridge-smoke-report.txt"
+          Remove-Item $env:AI_DEVICE_BRIDGE_SMOKE_REPORT -Force -ErrorAction SilentlyContinue
           & (Join-Path $installDir "AI Device Bridge.exe") --smoke-node
           if ($LASTEXITCODE -ne 0) {
-            $errorFile = Join-Path $env:TEMP "ai-device-bridge-smoke-error.txt"
+            $errorFile = $env:AI_DEVICE_BRIDGE_SMOKE_REPORT
             if (Test-Path $errorFile) {
               Add-Content $env:GITHUB_STEP_SUMMARY '### Installed smoke error'
               Add-Content $env:GITHUB_STEP_SUMMARY '```text'

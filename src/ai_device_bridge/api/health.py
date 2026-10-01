@@ -228,6 +228,10 @@ def create_app(
                 raise HTTPException(status_code=400, detail="接收数据大小不匹配。")
             if not hmac.compare_digest(digest.hexdigest(), x_file_sha256.lower()):
                 raise HTTPException(status_code=400, detail="SHA-256 校验失败。")
+            if require_receiver_approval and repository is not None and (
+                repository.authorized_sender(authorization[len("Bearer "):]) != sender
+            ):
+                raise HTTPException(status_code=403, detail="设备接收授权已撤销。")
             try:
                 os.link(temporary_path, target_path)
             except FileExistsError as error:

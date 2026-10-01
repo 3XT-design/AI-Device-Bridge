@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import ssl
 import traceback
@@ -16,7 +17,10 @@ from ai_device_bridge.infrastructure.tls_identity import load_or_create_tls_iden
 
 
 def run_node_smoke() -> int:
-    error_path = Path(gettempdir()) / "ai-device-bridge-smoke-error.txt"
+    error_path = Path(os.environ.get(
+        "AI_DEVICE_BRIDGE_SMOKE_REPORT",
+        str(Path(gettempdir()) / "ai-device-bridge-smoke-error.txt"),
+    ))
     error_path.unlink(missing_ok=True)
     try:
         _run_node_smoke()
