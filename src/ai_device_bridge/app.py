@@ -362,6 +362,14 @@ class MainWindow(QMainWindow):
         token_controls.addWidget(self.copy_token_button)
         token_controls.addWidget(self.rotate_grant_button)
         layout.addLayout(token_controls)
+        token_hint = QLabel(
+            "若该设备为接收端，则该码需填写在发送端的(发送文件页面-接收设备授权码处)"
+        )
+        token_hint.setWordWrap(True)
+        hint_font = token_hint.font()
+        hint_font.setPointSizeF(max(8.0, hint_font.pointSizeF() - 1.0))
+        token_hint.setFont(hint_font)
+        layout.addWidget(token_hint)
         layout.addLayout(local_controls)
         layout.addSpacing(20)
         layout.addWidget(QLabel("目标设备地址"))
