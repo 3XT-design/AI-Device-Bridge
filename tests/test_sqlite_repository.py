@@ -16,7 +16,7 @@ from ai_device_bridge.domain.models import (
     TransferStatus,
     TransferTask,
 )
-from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
+from ai_device_bridge.infrastructure.sqlite_repository import SCHEMA_VERSION, SQLiteRepository
 
 
 def test_sqlite_repository_round_trips_core_entities(tmp_path) -> None:
@@ -294,6 +294,94 @@ def test_repository_migrates_existing_plan_table_for_file_hash(tmp_path) -> None
         )}
     assert "expected_sha256" in columns
     assert "ai_plan_evidence" in tables
+    assert SQLiteRepository(database_path).schema_version() == SCHEMA_VERSION
+
+
+def test_m4_unversioned_database_upgrades_without_losing_user_data(tmp_path) -> None:
+    path = tmp_path / "bridge.sqlite3"
+    previous = SQLiteRepository(path)
+    now = datetime.now(UTC)
+    local = previous.get_or_create_local_device("Laptop", "Windows")
+    peer = DeviceProfile(uuid4(), "Desktop", "fingerprint", "Windows", now)
+    previous.save_peer(peer, "10.0.0.2:8765", "certificate", "saved-peer-token")
+    token = previous.get_or_create_receive_token()
+    plan = TransferPlan(
+        uuid4(), local.device_id, "C:/report.txt", peer.device_id, "Inbox",
+        SourceMode.MANUAL, "report.txt", 1, PlanStatus.CONFIRMED,
+        now, now + timedelta(minutes=15), "a" * 64,
+    )
+    previous.save_plan(plan)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 0")
+
+    upgraded = SQLiteRepository(path)
+    assert upgraded.schema_version() == SCHEMA_VERSION
+    assert upgraded.get_or_create_receive_token() == token
+    assert upgraded.get_peer_security(peer.device_id) == ("saved-peer-token", "certificate")
+    assert upgraded.get_plan(plan.plan_id) == plan
+    assert SQLiteRepository(path).schema_version() == SCHEMA_VERSION
+
+
+def test_newer_schema_is_rejected_without_modifying_database(tmp_path) -> None:
+    path = tmp_path / "future.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 999")
+    with pytest.raises(RuntimeError, match="高于程序支持"):
+        SQLiteRepository(path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 999
+
+
+def test_cleanup_removes_only_old_terminal_history_and_keeps_files_and_plans(tmp_path) -> None:
+    path = tmp_path / "bridge.sqlite3"
+    repository = SQLiteRepository(path)
+    now = datetime.now(UTC)
+    old = now - timedelta(days=40)
+    source = tmp_path / "keep.txt"
+    source.write_text("keep", encoding="utf-8")
+    local = repository.get_or_create_local_device("Laptop", "Windows")
+    peer = DeviceProfile(uuid4(), "Desktop", "fingerprint", "Windows", now)
+    repository.save_peer(peer, "10.0.0.2:8765", "certificate", "token")
+    plan = TransferPlan(
+        uuid4(), local.device_id, str(source), peer.device_id, "Inbox",
+        SourceMode.MANUAL, source.name, 4, PlanStatus.CONFIRMED,
+        old, now + timedelta(minutes=15), "a" * 64,
+    )
+    repository.save_plan(plan)
+    for status, when in (
+        (TransferStatus.COMPLETED, old),
+        (TransferStatus.FAILED, now),
+        (TransferStatus.TRANSFERRING, old),
+    ):
+        task = TransferTask(
+            uuid4(), plan.plan_id, local.device_id, peer.device_id,
+            source.name, 4, "a" * 64, 0, status, when, when,
+        )
+        record = TransferRecord(
+            uuid4(), task.task_id, TransferDirection.SENT, peer.device_id,
+            source.name, 4, status, when, when,
+        )
+        repository.save_transfer_attempt(task, record)
+        incoming = IncomingTransferAttempt(
+            uuid4(), source.name, "Inbox", 4, "a" * 64, 0,
+            status, when, when,
+        )
+        repository.save_incoming_attempt(incoming)
+    assert len(repository.list_history_entries()) == 6
+
+    assert repository.prune_terminal_history(now - timedelta(days=30)) == (1, 1)
+    restarted = SQLiteRepository(path)
+    assert len(restarted.list_history_entries()) == 4
+    assert {row.status for row in restarted.list_tasks()} == {
+        TransferStatus.FAILED, TransferStatus.TRANSFERRING,
+    }
+    assert restarted.get_plan(plan.plan_id) == plan
+    assert restarted.get_peer_security(peer.device_id) == ("token", "certificate")
+    assert source.read_text(encoding="utf-8") == "keep"
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repository.prune_terminal_history(datetime.now())
 
 
 def test_ai_plan_evidence_survives_restart_and_hidden_plan(tmp_path) -> None:

@@ -40,6 +40,7 @@ from ai_device_bridge.domain.models import (
 )
 from ai_device_bridge.infrastructure.node_server import NodeServer
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
+from ai_device_bridge.services.diagnostics import DiagnosticLog
 from ai_device_bridge.services.file_catalog import (
     FileCandidate,
     FileCatalogError,
@@ -224,6 +225,7 @@ class MainWindow(QMainWindow):
         local_device_id: UUID,
         local_fingerprint: str,
         receive_token: str,
+        diagnostics: DiagnosticLog | None = None,
     ) -> None:
         super().__init__()
         self.node_server = node_server
@@ -231,6 +233,8 @@ class MainWindow(QMainWindow):
         self.local_device_id = local_device_id
         self.local_fingerprint = local_fingerprint
         self.receive_token = receive_token
+        self.diagnostics = diagnostics
+        self.last_issue = ""
         self.health_worker: HealthCheckWorker | None = None
         self.file_worker: FileInspectionWorker | None = None
         self.transfer_worker: FileTransferWorker | None = None
@@ -247,8 +251,19 @@ class MainWindow(QMainWindow):
 
         title = QLabel("AI Device Bridge")
         title.setObjectName("projectTitle")
-        intro = QLabel("M4 可审核 AI 计划；确认后通过 HTTPS 传输并校验 SHA-256。")
+        intro = QLabel("M5：查找并审核文件、选择接收设备后，通过 HTTPS 传输并校验 SHA-256。")
         intro.setWordWrap(True)
+        self.guide_label = QLabel(
+            "首次使用：① 两台电脑启动本机服务；② 输入对端地址并检查设备；"
+            "③ 核对 TLS 指纹并保存配对；④ 从接收端复制授权码到发送端并保存；"
+            "⑤ 选择文件、确认计划，然后发送。AI 查找需先选择授权目录。"
+        )
+        self.guide_label.setWordWrap(True)
+        self.dismiss_guide_button = QPushButton("已了解，隐藏指引")
+        show_guide = repository.get_setting("onboarding_done") != "1"
+        self.guide_label.setVisible(show_guide)
+        self.dismiss_guide_button.setVisible(show_guide)
+        self.dismiss_guide_button.clicked.connect(self.dismiss_guide)
 
         self.local_status = QLabel("本机节点服务未启动")
         self.local_fingerprint_label = QLabel(
@@ -298,6 +313,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.addWidget(title)
         layout.addWidget(intro)
+        layout.addWidget(self.guide_label)
+        layout.addWidget(self.dismiss_guide_button)
         layout.addWidget(self.local_status)
         layout.addWidget(self.local_fingerprint_label)
         token_controls = QHBoxLayout()
@@ -342,13 +359,21 @@ class MainWindow(QMainWindow):
         self.target_directory = QLineEdit("AI Device Bridge Inbox")
         self.create_plan_button = QPushButton("预览并确认传输计划")
         self.create_plan_button.setEnabled(False)
+        self.preparation_hint = QLabel()
+        self.preparation_hint.setWordWrap(True)
         self.plan_list = QListWidget()
+        self.plan_filter = QLineEdit()
+        self.plan_filter.setPlaceholderText("搜索最近 500 条计划：文件名、设备或状态")
         self.plan_status = QLabel(
             "选择已确认计划后发送。接收文件保存在本机应用数据目录的 Received 文件夹。"
         )
         self.plan_status.setWordWrap(True)
         self.peer_token = QLineEdit()
         self.peer_token.setPlaceholderText("粘贴所选接收设备显示的授权码")
+        self.peer_token.textChanged.connect(
+            lambda value: self.diagnostics.add_secret(value)
+            if self.diagnostics is not None and len(value) >= 20 else None
+        )
         self.save_peer_token_button = QPushButton("保存授权码")
         self.save_peer_token_button.setEnabled(False)
         self.send_plan_button = QPushButton("发送所选计划")
@@ -360,7 +385,10 @@ class MainWindow(QMainWindow):
         self.transfer_progress.setValue(0)
         self.transfer_progress.setFormat("尚未开始传输")
         self.transfer_history = QListWidget()
+        self.history_filter = QLineEdit()
+        self.history_filter.setPlaceholderText("搜索最近 2000 条传输历史：文件名、方向或状态")
         self.transfer_history.setMaximumHeight(160)
+        self.prune_history_button = QPushButton("清理 30 天前的已结束历史")
         self.delete_plan_button = QPushButton("删除所选计划")
         self.delete_plan_button.setEnabled(False)
 
@@ -374,7 +402,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("接收端目标目录"))
         layout.addWidget(self.target_directory)
         layout.addWidget(self.create_plan_button)
+        layout.addWidget(self.preparation_hint)
         layout.addWidget(QLabel("最近传输计划"))
+        layout.addWidget(self.plan_filter)
         layout.addWidget(self.plan_list)
         peer_token_controls = QHBoxLayout()
         peer_token_controls.addWidget(QLabel("接收设备授权码"))
@@ -389,16 +419,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.transfer_progress)
         layout.addWidget(self.plan_status)
         layout.addWidget(QLabel("最近传输历史"))
+        layout.addWidget(self.history_filter)
         layout.addWidget(self.transfer_history)
+        layout.addWidget(self.prune_history_button)
 
         self.choose_file_button.clicked.connect(self.choose_file)
         self.create_plan_button.clicked.connect(self.create_transfer_plan)
+        self.plan_filter.textChanged.connect(self.refresh_plan_list)
         self.refresh_plan_list()
         self.save_peer_token_button.clicked.connect(self.save_selected_peer_token)
         self.send_plan_button.clicked.connect(self.send_selected_plan)
         self.cancel_transfer_button.clicked.connect(self.cancel_active_transfer)
         self.delete_plan_button.clicked.connect(self.delete_selected_plan)
         self.plan_list.itemSelectionChanged.connect(self.update_send_button_state)
+        self.history_filter.textChanged.connect(self.refresh_transfer_history)
+        self.prune_history_button.clicked.connect(self.prune_old_history)
         self.refresh_transfer_history()
         self.history_timer = QTimer(self)
         self.history_timer.setInterval(3000)
@@ -410,10 +445,13 @@ class MainWindow(QMainWindow):
         self.choose_root_button = QPushButton("选择授权目录")
         self.ollama_url = QLineEdit(repository.get_setting("ollama_url", "http://127.0.0.1:11434"))
         self.ollama_model = QLineEdit(repository.get_setting("ollama_model", "qwen2.5:3b"))
+        self.save_ai_settings_button = QPushButton("保存 AI 设置")
         self.file_query = QLineEdit()
         self.file_query.setPlaceholderText("例如：找最近修改的深度学习论文并准备发给台式机")
         self.search_files_button = QPushButton("AI 查找候选文件")
         self.search_files_button.setEnabled(False)
+        self.search_hint = QLabel()
+        self.search_hint.setWordWrap(True)
         self.candidate_list = QListWidget()
         self.candidate_list.setMaximumHeight(150)
         self.candidate_status = QLabel(
@@ -430,15 +468,18 @@ class MainWindow(QMainWindow):
         model_controls.addWidget(self.ollama_url, 1)
         model_controls.addWidget(QLabel("模型"))
         model_controls.addWidget(self.ollama_model)
+        model_controls.addWidget(self.save_ai_settings_button)
         layout.addWidget(QLabel("AI 文件、设备与目录意图计划（M4）"))
         layout.addLayout(root_controls)
         layout.addLayout(model_controls)
         layout.addWidget(self.file_query)
         layout.addWidget(self.search_files_button)
+        layout.addWidget(self.search_hint)
         layout.addWidget(self.candidate_list)
         layout.addWidget(self.use_candidate_button)
         layout.addWidget(self.candidate_status)
         self.choose_root_button.clicked.connect(self.choose_authorized_root)
+        self.save_ai_settings_button.clicked.connect(self.save_ai_settings)
         self.search_files_button.clicked.connect(self.search_authorized_files)
         self.use_candidate_button.clicked.connect(self.use_selected_candidate)
         self.candidate_list.itemSelectionChanged.connect(
@@ -448,6 +489,74 @@ class MainWindow(QMainWindow):
         )
         self.file_query.textChanged.connect(self.invalidate_search_results)
         self.update_search_button_state()
+        self.diagnostic_button = QPushButton("复制诊断信息")
+        self.diagnostic_button.clicked.connect(self.copy_diagnostics)
+        self.diagnostic_status = QLabel("诊断信息包含版本、数据目录、数据库版本及最近错误。")
+        self.diagnostic_status.setWordWrap(True)
+        layout.addWidget(QLabel("诊断与支持"))
+        layout.addWidget(self.diagnostic_button)
+        layout.addWidget(self.diagnostic_status)
+        self.update_plan_button_state()
+
+    def dismiss_guide(self) -> None:
+        self.repository.save_setting("onboarding_done", "1")
+        self.guide_label.hide()
+        self.dismiss_guide_button.hide()
+
+    def save_ai_settings(self) -> None:
+        from urllib.parse import urlsplit
+
+        url = self.ollama_url.text().strip()
+        model = self.ollama_model.text().strip()
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or not model:
+            self.candidate_status.setText("请填写有效的 Ollama HTTP(S) 地址和模型名称。")
+            return
+        self.repository.save_setting("ollama_url", url)
+        self.repository.save_setting("ollama_model", model)
+        self.candidate_status.setText("AI 设置已保存。")
+
+    def _record_issue(self, code: str, message: str) -> None:
+        self.last_issue = message
+        if self.diagnostics is not None:
+            self.diagnostics.event(code, message)
+
+    def copy_diagnostics(self) -> None:
+        if self.diagnostics is None:
+            self.diagnostic_status.setText("此运行环境未配置诊断日志。")
+            return
+        report = self.diagnostics.report(
+            version=__version__,
+            schema_version=self.repository.schema_version(),
+            service="运行中" if self.stop_button.isEnabled() else "未启动",
+            issue=self.last_issue,
+        )
+        QApplication.clipboard().setText(report)
+        self.diagnostic_status.setText("诊断信息已复制，可粘贴反馈；授权码和私钥已脱敏。")
+
+    def prune_old_history(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "清理旧历史",
+            "清理 30 天前已结束的发送与接收历史？\n"
+            "计划、配对信息和磁盘上的文件都会保留。此操作无法撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            sent, received = self.repository.prune_terminal_history(
+                datetime.now(UTC) - timedelta(days=30)
+            )
+        except sqlite3.Error as error:
+            self._record_issue("HISTORY_CLEANUP_FAILED", str(error))
+            self.diagnostic_status.setText(f"清理失败：{error}")
+            return
+        self.refresh_transfer_history()
+        self.diagnostic_status.setText(
+            f"已清理 {sent} 条发送记录、{received} 条接收记录；计划与文件保留。"
+        )
 
     def choose_authorized_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择本次允许 AI 检索的文件夹")
@@ -477,6 +586,16 @@ class MainWindow(QMainWindow):
                 and not worker_busy
             )
         )
+        if worker_busy:
+            reason = "正在检索，请等待完成。"
+        elif not self.authorized_root.text().strip():
+            reason = "请先选择授权目录。"
+        elif not self.file_query.text().strip():
+            reason = "请描述要查找的文件。"
+        else:
+            reason = "可以开始检索。"
+        self.search_files_button.setToolTip(reason)
+        self.search_hint.setText(reason)
 
     def search_authorized_files(self) -> None:
         if self.search_worker and self.search_worker.isRunning():
@@ -566,6 +685,7 @@ class MainWindow(QMainWindow):
         self.use_candidate_button.setEnabled(False)
 
     def on_file_search_failed(self, message: str) -> None:
+        self._record_issue("AI_SEARCH_FAILED", message)
         self.search_result = None
         self.candidate_status.setText(f"AI 文件检索失败：{message}")
         self.use_candidate_button.setEnabled(False)
@@ -645,6 +765,7 @@ class MainWindow(QMainWindow):
         try:
             self.node_server.start()
         except RuntimeError as error:
+            self._record_issue("LOCAL_SERVICE_START_FAILED", str(error))
             self.local_status.setText(f"本机服务启动失败：{error}")
             return
         self.local_status.setText("本机服务已启动，监听端口 8765。")
@@ -805,6 +926,7 @@ class MainWindow(QMainWindow):
             self.pending_ai_candidate = None
 
     def on_file_inspection_failed(self, message: str) -> None:
+        self._record_issue("FILE_INSPECTION_FAILED", message)
         self.pending_ai_candidate_plan = False
         self.pending_ai_candidate = None
         self.inspected_file = None
@@ -820,6 +942,16 @@ class MainWindow(QMainWindow):
         file_ready = self.inspected_file is not None
         worker_busy = bool(self.file_worker and self.file_worker.isRunning())
         self.create_plan_button.setEnabled(peer_ready and file_ready and not worker_busy)
+        if worker_busy:
+            reason = "正在计算文件校验值。"
+        elif not peer_ready:
+            reason = "请先在已配对设备列表中选择接收设备。"
+        elif not file_ready:
+            reason = "请先选择文件并等待 SHA-256 计算完成。"
+        else:
+            reason = "可以预览并确认计划。"
+        self.create_plan_button.setToolTip(reason)
+        self.preparation_hint.setText(reason)
 
     def create_transfer_plan(
         self, _checked: bool = False, *, from_ai_candidate: bool = False
@@ -933,17 +1065,27 @@ class MainWindow(QMainWindow):
         self.plan_status.setText(f"传输计划已保存（{plan.plan_id}），文件仍保留在本机，尚未发送。")
 
     def refresh_plan_list(self) -> None:
+        selected = self.plan_list.currentItem()
+        selected_id = selected.data(Qt.ItemDataRole.UserRole) if selected else None
+        query = self.plan_filter.text().strip().casefold()
         self.plan_list.clear()
-        for plan in self.repository.list_plans(limit=20):
+        for plan in self.repository.list_plans(limit=500):
             target = self.repository.get_device(plan.target_device_id)
             target_name = target.device_name if target else str(plan.target_device_id)
             source_label = "AI" if plan.source_mode is SourceMode.NATURAL_LANGUAGE else "手动"
+            searchable = f"{plan.file_name} {target_name} {plan.status.value} {source_label}"
+            if query and query not in searchable.casefold():
+                continue
+            if self.plan_list.count() >= 100:
+                break
             self.plan_list.addItem(
                 f"[{source_label}] {plan.file_name} → {target_name} · {plan.status.value} · "
                 f"{plan.file_size_bytes} B · SHA-256 {plan.expected_sha256[:12]}…"
             )
             plan_item = self.plan_list.item(self.plan_list.count() - 1)
             plan_item.setData(Qt.ItemDataRole.UserRole, str(plan.plan_id))
+            if selected_id == str(plan.plan_id):
+                self.plan_list.setCurrentItem(plan_item)
             if plan.source_mode is SourceMode.NATURAL_LANGUAGE:
                 evidence = self.repository.get_ai_plan_evidence(plan.plan_id)
                 if evidence:
@@ -1007,6 +1149,8 @@ class MainWindow(QMainWindow):
         except (ValueError, sqlite3.Error) as error:
             self.plan_status.setText(f"授权码保存失败：{error}")
             return
+        if self.diagnostics is not None:
+            self.diagnostics.add_secret(token)
         self.plan_status.setText("接收设备授权码已保存。")
         self.update_send_button_state()
 
@@ -1158,25 +1302,18 @@ class MainWindow(QMainWindow):
             TransferStatus.CANCELLED: "已取消",
             TransferStatus.REJECTED: "已拒绝",
         }
-        rows = []
-        for record in self.repository.list_records()[:50]:
-            label = status_labels[record.status]
-            task = self.repository.get_task(record.task_id)
-            detail = f"；{task.error_message}" if task and task.error_message else ""
-            rows.append(
-                (
-                    record.started_at or record.finished_at,
-                    f"发出 · {record.file_name}：{label}{detail}",
-                )
-            )
-        for attempt in self.repository.list_incoming_attempts():
-            label = status_labels[attempt.status]
-            detail = f"；{attempt.error_message}" if attempt.error_message else ""
-            rows.append((attempt.created_at, f"接收 · {attempt.file_name}：{label}{detail}"))
-        rows.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC), reverse=True)
+        query = self.history_filter.text().strip().casefold()
         self.transfer_history.clear()
-        for _timestamp, label in rows[:50]:
-            self.transfer_history.addItem(label)
+        for entry in self.repository.list_history_entries(limit=2000):
+            direction = "发出" if entry.direction.value == "sent" else "接收"
+            label = status_labels[entry.status]
+            detail = f"；{entry.error_message}" if entry.error_message else ""
+            text = f"{direction} · {entry.file_name}：{label}{detail}"
+            if query and query not in text.casefold():
+                continue
+            if self.transfer_history.count() >= 100:
+                break
+            self.transfer_history.addItem(text)
 
     def on_transfer_succeeded(self, result: dict[str, object]) -> None:
         self.cancel_transfer_button.setEnabled(False)
@@ -1202,6 +1339,7 @@ class MainWindow(QMainWindow):
         )
 
     def on_transfer_failed(self, message: str) -> None:
+        self._record_issue("TRANSFER_FAILED", message)
         self.cancel_transfer_button.setEnabled(False)
         self.refresh_transfer_history()
         self.plan_status.setText(f"发送失败：{message}")
@@ -1242,6 +1380,7 @@ class MainWindow(QMainWindow):
                 self.peer_status.setText("配对已解除；已保存的传输计划和历史设备资料仍保留。")
 
     def on_health_check_failed(self, message: str) -> None:
+        self._record_issue("HEALTH_CHECK_FAILED", message)
         self.peer_status.setText(f"连接失败：{message}")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
@@ -1279,14 +1418,31 @@ def main() -> int:
     app = QApplication(sys.argv)
     app_data = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     data_dir = app_data / "AI Device Bridge"
-    repository = SQLiteRepository(data_dir / "bridge.sqlite3")
-    TransferJournal.reconcile_interrupted(repository)
-    repository.reconcile_incomplete_incoming()
-    from ai_device_bridge.infrastructure.tls_identity import load_or_create_tls_identity
+    diagnostics = DiagnosticLog(data_dir)
+    try:
+        repository = SQLiteRepository(data_dir / "bridge.sqlite3")
+        receive_token = repository.get_or_create_receive_token()
+        diagnostics.add_secret(receive_token)
+        for peer in repository.list_paired_devices():
+            peer_token, _certificate = repository.get_peer_security(peer.device_id)
+            diagnostics.add_secret(peer_token)
+        TransferJournal.reconcile_interrupted(repository)
+        repository.reconcile_incomplete_incoming()
+        from ai_device_bridge.infrastructure.tls_identity import load_or_create_tls_identity
 
-    identity = load_or_create_tls_identity(data_dir)
-    receive_token = repository.get_or_create_receive_token()
-    local_device = repository.get_or_create_local_device(socket.gethostname(), platform.system())
+        identity = load_or_create_tls_identity(data_dir)
+        local_device = repository.get_or_create_local_device(
+            socket.gethostname(), platform.system()
+        )
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as error:
+        message = diagnostics.redact(str(error))
+        diagnostics.event("APP_START_FAILED", message)
+        QMessageBox.critical(
+            None, "AI Device Bridge 启动失败",
+            f"{message}\n\n诊断日志：{diagnostics.path}",
+        )
+        return 1
+    diagnostics.event("APP_STARTED", f"version={__version__} schema={repository.schema_version()}")
     window = MainWindow(
         NodeServer(
             device_id=local_device.device_id,
@@ -1302,6 +1458,7 @@ def main() -> int:
         local_device.device_id,
         identity.fingerprint,
         receive_token,
+        diagnostics,
     )
     window.show()
     return app.exec()

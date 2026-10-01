@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from ai_device_bridge.app import MainWindow
 from ai_device_bridge.domain.models import DeviceProfile, SourceMode
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
+from ai_device_bridge.services.diagnostics import DiagnosticLog
 from ai_device_bridge.services.file_catalog import FileCandidate
 from ai_device_bridge.services.file_inspection import inspect_file
 from ai_device_bridge.services.intent_planning import IntentSearchResult, parse_transfer_intent
@@ -71,3 +72,28 @@ def test_reviewed_candidate_creates_traceable_ai_plan_without_sending(
     window.history_timer.stop()
     window.close()
     assert application is not None
+
+
+def test_m5_guidance_search_and_copied_diagnostics(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    local = repository.get_or_create_local_device("Laptop", "Windows")
+    diagnostics = DiagnosticLog(tmp_path, ("sensitive-receive-token",))
+    window = MainWindow(
+        SimpleNamespace(stop=lambda: None), repository, local.device_id,
+        "fingerprint", "sensitive-receive-token", diagnostics,
+    )
+    assert not window.guide_label.isHidden()
+    window.dismiss_guide()
+    assert repository.get_setting("onboarding_done") == "1"
+    assert window.guide_label.isHidden()
+    assert "授权目录" in window.search_files_button.toolTip()
+    window._record_issue("CONNECTION_FAILED", "token=sensitive-receive-token")
+    window.copy_diagnostics()
+    copied = application.clipboard().text()
+    assert "0.5.0rc1" in copied
+    assert "sensitive-receive-token" not in copied
+    assert "数据库版本：3" in copied
+    window.history_timer.stop()
+    window.close()

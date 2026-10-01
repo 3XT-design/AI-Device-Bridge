@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -23,6 +24,17 @@ from ai_device_bridge.domain.models import (
     TransferStatus,
     TransferTask,
 )
+
+SCHEMA_VERSION = 3
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryEntry:
+    direction: TransferDirection
+    file_name: str
+    status: TransferStatus
+    occurred_at: datetime
+    error_message: str | None
 
 
 class SQLiteRepository:
@@ -50,7 +62,14 @@ class SQLiteRepository:
 
     def initialize(self) -> None:
         with self._connection() as connection:
-            connection.executescript(
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"数据库版本 {version} 高于程序支持的 {SCHEMA_VERSION}；请使用较新版本。"
+                )
+            connection.execute("BEGIN IMMEDIATE")
+            if version < 1:
+                _execute_schema(connection,
                 """
                 CREATE TABLE IF NOT EXISTS devices (
                     device_id TEXT PRIMARY KEY,
@@ -85,15 +104,6 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     expected_sha256 TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS ai_plan_evidence (
-                    plan_id TEXT PRIMARY KEY REFERENCES plans(plan_id),
-                    request_text TEXT NOT NULL,
-                    authorized_root TEXT NOT NULL,
-                    candidates_json TEXT NOT NULL,
-                    selected_candidate_id TEXT NOT NULL,
-                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -149,23 +159,54 @@ class SQLiteRepository:
                 CREATE INDEX IF NOT EXISTS idx_incoming_created_at
                     ON incoming_transfers(created_at DESC);
                 """
-            )
-            plan_columns = {row["name"] for row in connection.execute("PRAGMA table_info(plans)")}
-            if "expected_sha256" not in plan_columns:
-                connection.execute(
-                    "ALTER TABLE plans ADD COLUMN expected_sha256 TEXT NOT NULL DEFAULT ''"
                 )
-            peer_columns = {
-                row["name"] for row in connection.execute("PRAGMA table_info(peer_addresses)")
-            }
-            if "transfer_token" not in peer_columns:
+                plan_columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(plans)")
+                }
+                if "expected_sha256" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN expected_sha256 TEXT NOT NULL DEFAULT ''"
+                    )
+                peer_columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(peer_addresses)")
+                }
+                if "transfer_token" not in peer_columns:
+                    connection.execute(
+                        "ALTER TABLE peer_addresses ADD COLUMN transfer_token "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+                if "certificate_pem" not in peer_columns:
+                    connection.execute(
+                        "ALTER TABLE peer_addresses ADD COLUMN certificate_pem "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+                connection.execute("PRAGMA user_version = 1")
+            if version < 2:
                 connection.execute(
-                    "ALTER TABLE peer_addresses ADD COLUMN transfer_token TEXT NOT NULL DEFAULT ''"
+                    """CREATE TABLE IF NOT EXISTS ai_plan_evidence (
+                        plan_id TEXT PRIMARY KEY REFERENCES plans(plan_id),
+                        request_text TEXT NOT NULL,
+                        authorized_root TEXT NOT NULL,
+                        candidates_json TEXT NOT NULL,
+                        selected_candidate_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )"""
                 )
-            if "certificate_pem" not in peer_columns:
+                connection.execute("PRAGMA user_version = 2")
+            if version < 3:
                 connection.execute(
-                    "ALTER TABLE peer_addresses ADD COLUMN certificate_pem TEXT NOT NULL DEFAULT ''"
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated "
+                    "ON tasks(status, updated_at)"
                 )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_incoming_status_updated "
+                    "ON incoming_transfers(status, updated_at)"
+                )
+                connection.execute("PRAGMA user_version = 3")
+
+    def schema_version(self) -> int:
+        with self._connection() as connection:
+            return connection.execute("PRAGMA user_version").fetchone()[0]
 
     def get_or_create_node_id(self) -> UUID:
         """Return this installation's stable node ID, creating it on first run."""
@@ -526,6 +567,62 @@ class SQLiteRepository:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def list_history_entries(self, limit: int = 2000) -> list[HistoryEntry]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT direction, file_name, status, occurred_at, error_message FROM (
+                    SELECT r.direction, r.file_name, r.status,
+                           COALESCE(r.finished_at, r.started_at, t.created_at) AS occurred_at,
+                           t.error_message
+                    FROM transfer_records AS r JOIN tasks AS t ON t.task_id = r.task_id
+                    UNION ALL
+                    SELECT 'received', file_name, status, created_at, error_message
+                    FROM incoming_transfers
+                ) ORDER BY occurred_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [
+            HistoryEntry(
+                direction=TransferDirection(row["direction"]),
+                file_name=row["file_name"],
+                status=TransferStatus(row["status"]),
+                occurred_at=_text_to_datetime(row["occurred_at"]),
+                error_message=row["error_message"],
+            )
+            for row in rows
+        ]
+
+    def prune_terminal_history(self, before: datetime) -> tuple[int, int]:
+        """Delete old finished task/receive rows; retain plans, devices and disk files."""
+        if before.tzinfo is None or before.utcoffset() is None:
+            raise ValueError("before must be timezone-aware")
+        cutoff = _datetime_to_text(before)
+        terminal = tuple(status.value for status in (
+            TransferStatus.COMPLETED, TransferStatus.FAILED,
+            TransferStatus.CANCELLED, TransferStatus.REJECTED,
+        ))
+        with self._connection() as connection:
+            matching = (
+                "task_id IN (SELECT task_id FROM tasks "
+                "WHERE status IN (?, ?, ?, ?) AND julianday(updated_at) < julianday(?))"
+            )
+            connection.execute(
+                f"DELETE FROM transfer_records WHERE {matching}", (*terminal, cutoff)
+            )
+            sent = connection.execute(
+                "DELETE FROM tasks WHERE status IN (?, ?, ?, ?) "
+                "AND julianday(updated_at) < julianday(?)",
+                (*terminal, cutoff),
+            ).rowcount
+            received = connection.execute(
+                "DELETE FROM incoming_transfers WHERE status IN (?, ?, ?, ?) "
+                "AND julianday(updated_at) < julianday(?)",
+                (*terminal, cutoff),
+            ).rowcount
+        return sent, received
+
     def save_incoming_attempt(self, attempt: IncomingTransferAttempt) -> None:
         with self._connection() as connection:
             connection.execute(
@@ -578,6 +675,13 @@ class SQLiteRepository:
                 ),
             )
             return cursor.rowcount
+
+
+def _execute_schema(connection: sqlite3.Connection, script: str) -> None:
+    """Execute migration DDL inside the caller's transaction."""
+    for statement in script.split(";"):
+        if statement.strip():
+            connection.execute(statement)
 
 
 def _save_task(connection: sqlite3.Connection, task: TransferTask) -> None:
