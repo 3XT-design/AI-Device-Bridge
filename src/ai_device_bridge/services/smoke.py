@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import socket
 import ssl
+import traceback
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, gettempdir
 
 import httpx
 
@@ -15,6 +16,17 @@ from ai_device_bridge.infrastructure.tls_identity import load_or_create_tls_iden
 
 
 def run_node_smoke() -> int:
+    error_path = Path(gettempdir()) / "ai-device-bridge-smoke-error.txt"
+    error_path.unlink(missing_ok=True)
+    try:
+        _run_node_smoke()
+    except Exception:
+        error_path.write_text(traceback.format_exc(), encoding="utf-8")
+        return 1
+    return 0
+
+
+def _run_node_smoke() -> None:
     with TemporaryDirectory(prefix="ai-device-bridge-smoke-") as directory:
         root = Path(directory)
         repository = SQLiteRepository(root / "bridge.sqlite3")
@@ -41,4 +53,3 @@ def run_node_smoke() -> int:
                     raise RuntimeError("健康检查没有返回 status=ok")
         finally:
             server.stop()
-    return 0

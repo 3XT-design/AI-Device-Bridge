@@ -27,21 +27,34 @@ jobs:
       - name: Build portable package and installer
         shell: pwsh
         run: ./scripts/build_windows_release.ps1
-      - name: Smoke check packaged and installed node
+      - name: Smoke check portable ZIP
         shell: pwsh
         run: |
           $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
           Expand-Archive ./release/AI-Device-Bridge-portable-windows-x64.zip $portableDir
           & (Join-Path $portableDir "AI Device Bridge.exe") --smoke-node
-          if ($LASTEXITCODE -ne 0) { throw "Portable node smoke check failed." }
-
+          if ($LASTEXITCODE -ne 0) {
+            $errorFile = Join-Path $env:TEMP "ai-device-bridge-smoke-error.txt"
+            if (Test-Path $errorFile) { Get-Content $errorFile }
+            throw "Portable node smoke check failed."
+          }
+      - name: Smoke check installed package
+        shell: pwsh
+        run: |
           $installer = Resolve-Path ./release/AI-Device-Bridge-Setup.exe
           $installDir = Join-Path $env:RUNNER_TEMP "Bridge Installed"
           & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
           if ($LASTEXITCODE -ne 0) { throw "Silent install failed." }
           & (Join-Path $installDir "AI Device Bridge.exe") --smoke-node
-          if ($LASTEXITCODE -ne 0) { throw "Installed node smoke check failed." }
-
+          if ($LASTEXITCODE -ne 0) {
+            $errorFile = Join-Path $env:TEMP "ai-device-bridge-smoke-error.txt"
+            if (Test-Path $errorFile) { Get-Content $errorFile }
+            throw "Installed node smoke check failed."
+          }
+      - name: Check uninstall preserves application data
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP "Bridge Installed"
           $dataDir = Join-Path $env:APPDATA "AI Device Bridge"
           New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
           $marker = Join-Path $dataDir "ci-retention.txt"

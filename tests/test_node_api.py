@@ -11,7 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ai_device_bridge import __version__
-from ai_device_bridge.api.health import API_VERSION, STAGING_DIRECTORY_NAME, create_app
+from ai_device_bridge.api.health import (
+    API_VERSION,
+    STAGING_DIRECTORY_NAME,
+    TRANSFER_PROTOCOL_VERSION,
+    create_app,
+)
 from ai_device_bridge.domain.models import DeviceProfile, TransferStatus
 from ai_device_bridge.infrastructure.node_server import cleanup_orphaned_parts
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
@@ -32,6 +37,7 @@ def test_health_endpoint_returns_node_metadata_and_tls_identity() -> None:
         "platform": platform.system(),
         "app_version": __version__,
         "api_version": API_VERSION,
+        "transfer_protocol_version": TRANSFER_PROTOCOL_VERSION,
         "certificate_fingerprint": "",
         "certificate_pem": "",
     }
@@ -229,6 +235,22 @@ def test_strict_receiver_requires_paired_grant_and_one_time_approval(tmp_path) -
     assert new_grant != grant
     assert client.post("/api/v1/transfers/requests", headers=auth, json=offer).status_code == 401
     new_auth = {"Authorization": f"Bearer {new_grant}"}
+    requested = client.post("/api/v1/transfers/requests", headers=new_auth, json=offer)
+    approved_id = UUID(requested.json()["request_id"])
+    assert repository.decide_receive_request(approved_id, approve=True)
+    newest_grant = repository.rotate_receive_grant(sender.device_id)
+    assert repository.get_receive_request(approved_id).status == "rejected"
+    assert client.put(
+        f"/api/v1/transfers/{approved_id}",
+        headers={**upload_headers, **new_auth}, content=content,
+    ).status_code == 401
+    new_auth = {"Authorization": f"Bearer {newest_grant}"}
+    requested = client.post("/api/v1/transfers/requests", headers=new_auth, json=offer)
+    cancelled_id = requested.json()["request_id"]
+    assert client.delete(
+        f"/api/v1/transfers/requests/{cancelled_id}", headers=new_auth
+    ).json() == {"status": "rejected"}
+    assert repository.get_receive_request(UUID(cancelled_id)).status == "rejected"
     requested = client.post("/api/v1/transfers/requests", headers=new_auth, json=offer)
     with sqlite3.connect(repository.database_path) as connection:
         connection.execute(

@@ -22,6 +22,7 @@ from ai_device_bridge.domain.models import IncomingTransferAttempt, TransferStat
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 
 API_VERSION = "v1"
+TRANSFER_PROTOCOL_VERSION = 2
 STAGING_DIRECTORY_NAME = ".bridge-staging"
 
 
@@ -32,6 +33,7 @@ class HealthResponse(BaseModel):
     platform: str
     app_version: str
     api_version: str
+    transfer_protocol_version: int = 1
     certificate_fingerprint: str
     certificate_pem: str
 
@@ -73,6 +75,7 @@ def create_app(
             platform=platform.system(),
             app_version=__version__,
             api_version=API_VERSION,
+            transfer_protocol_version=TRANSFER_PROTOCOL_VERSION,
             certificate_fingerprint=certificate_fingerprint,
             certificate_pem=certificate_pem,
         )

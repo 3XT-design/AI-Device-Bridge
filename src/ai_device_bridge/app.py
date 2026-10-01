@@ -244,7 +244,7 @@ class FileSearchWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """Initial window; later milestones will add device and transfer workflows."""
+    """Desktop workflows for pairing, file plans, receiving and history."""
 
     def __init__(
         self,
@@ -282,7 +282,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("AI Device Bridge")
         title.setObjectName("projectTitle")
-        intro = QLabel("M5：查找并审核文件、选择接收设备后，通过 HTTPS 传输并校验 SHA-256。")
+        intro = QLabel("两端确认配对与逐次接收后，通过 HTTPS 传输并校验 SHA-256。")
         intro.setWordWrap(True)
         self.guide_label = QLabel(
             "首次使用：① 两台电脑在“设备与配对”页互相检查地址、核对 TLS 指纹并保存配对；"

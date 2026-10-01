@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import ValidationError
 
-from ai_device_bridge.api.health import HealthResponse
+from ai_device_bridge.api.health import TRANSFER_PROTOCOL_VERSION, HealthResponse
 
 
 class PeerHealthError(RuntimeError):
@@ -76,6 +76,8 @@ def check_peer_health(
 
     if result.status != "ok":
         raise PeerHealthError("设备节点当前状态异常。")
+    if result.transfer_protocol_version != TRANSFER_PROTOCOL_VERSION:
+        raise PeerHealthError("目标设备不支持逐次接收确认，请将两台电脑都更新到 M6 版本。")
     if actual_fingerprint != result.certificate_fingerprint.lower():
         raise PeerHealthError("设备报告的 TLS 指纹与实际连接证书不一致。")
     if expected_fingerprint and actual_fingerprint != expected_fingerprint.lower():

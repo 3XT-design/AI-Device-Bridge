@@ -1,4 +1,6 @@
+import time
 from datetime import UTC, datetime
+from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -140,3 +142,41 @@ def test_receiver_approval_dialog_decides_pending_request(tmp_path, monkeypatch)
     window.receive_timer.stop()
     window.close()
     assert application is not None
+
+
+def test_local_service_start_reports_progress_without_blocking_ui(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    local = repository.get_or_create_local_device("Laptop", "Windows")
+    entered = Event()
+    release = Event()
+
+    class SlowServer:
+        is_running = False
+
+        def start(self):
+            entered.set()
+            release.wait(timeout=2)
+            self.is_running = True
+
+        def stop(self):
+            self.is_running = False
+
+    window = MainWindow(SlowServer(), repository, local.device_id, "fingerprint", "")
+    window.start_local_service()
+    assert "正在启动" in window.local_status.text()
+    assert not window.start_button.isEnabled()
+    assert entered.wait(timeout=1)
+    release.set()
+    window.start_worker.wait(2000)
+    for _ in range(30):
+        application.processEvents()
+        if window.stop_button.isEnabled():
+            break
+        time.sleep(0.01)
+    assert window.stop_button.isEnabled()
+    assert "已启动" in window.local_status.text()
+    window.history_timer.stop()
+    window.receive_timer.stop()
+    window.close()

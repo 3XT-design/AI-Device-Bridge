@@ -1,4 +1,4 @@
-"""SQLite persistence for the M1-02 domain objects."""
+"""SQLite persistence, migrations, peer grants and transfer history."""
 
 from __future__ import annotations
 
@@ -846,6 +846,11 @@ class SQLiteRepository:
                 "AND julianday(updated_at) < julianday(?)",
                 (*terminal, cutoff),
             ).rowcount
+            connection.execute(
+                "DELETE FROM receive_requests WHERE status IN ('rejected', 'expired', 'consumed') "
+                "AND julianday(expires_at) < julianday(?)",
+                (cutoff,),
+            )
         return sent, received
 
     def save_incoming_attempt(self, attempt: IncomingTransferAttempt) -> None:
