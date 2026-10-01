@@ -536,9 +536,13 @@ class MainWindow(QMainWindow):
                     self.select_peer(peer_item)
                     break
         for candidate in result.candidates:
-            modified = candidate.modified_at.astimezone().strftime("%Y-%m-%d %H:%M")
+            use_created = result.recent_by == "created" and candidate.created_at is not None
+            shown_at = candidate.created_at if use_created else candidate.modified_at
+            date_label = "创建" if use_created else "修改"
+            timestamp = shown_at.astimezone().strftime("%Y-%m-%d %H:%M")
             item = QListWidgetItem(
-                f"{candidate.relative_path} · {candidate.file_size_bytes} B · {modified}"
+                f"{candidate.relative_path} · {candidate.file_size_bytes} B · "
+                f"{date_label} {timestamp}"
             )
             item.setData(Qt.ItemDataRole.UserRole, candidate.candidate_id)
             self.candidate_list.addItem(item)

@@ -15,6 +15,10 @@ from ai_device_bridge.services.file_catalog import (
     rank_candidates_with_ollama,
 )
 
+ARCHIVE_EXTENSIONS = (
+    ".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz", ".gz", ".bz2", ".xz"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class IntentSearchResult:
@@ -26,6 +30,7 @@ class IntentSearchResult:
     request_text: str
     authorized_root: str
     scanned_count: int = 0
+    recent_by: str = "modified"
 
 
 def parse_transfer_intent(
@@ -70,7 +75,9 @@ def parse_transfer_intent(
         )
         after = (local_monday - timedelta(days=7)).astimezone(UTC)
         before = local_monday.astimezone(UTC)
-    elif "最近" in text:
+    elif re.search(r"(?:最近|最新).{0,4}下载", text):
+        questions.append("“最近下载”按文件创建时间近似排序，不限制日期。")
+    elif "最近" in text or "最新" in text:
         questions.append("“最近”按修改时间从新到旧排序，不限制日期。")
 
     extensions = re.findall(
@@ -97,7 +104,7 @@ def parse_transfer_intent(
     )
     file_terms = re.sub(r"\.[A-Za-z0-9]+\b", " ", file_terms)
     file_terms = re.sub(
-        r"上周|最近|修改|请|帮我|把|查找|寻找|找|发送给|发给|传给|发送到|发到|传到|发送|传输|"
+        r"上周|最近|最新|修改|请|帮我|把|查找|寻找|找|发送给|发给|传给|发送到|发到|传到|发送|传输|"
         r"准备|一份|那份|这份|文件夹|文件|目录|的|给|到|至|并|一下|那个|这个",
         " ",
         file_terms,
@@ -109,7 +116,10 @@ def parse_transfer_intent(
         modified_after=after,
         modified_before=before,
     )
-    if not (query.keywords or query.extensions or query.modified_after or "最近" in text):
+    if not (
+        query.keywords or query.extensions or query.modified_after
+        or "最近" in text or "最新" in text
+    ):
         questions.append("文件条件不够明确，请补充文件名、类型或时间。")
     return ParsedTransferIntent(
         file_query=query,
@@ -131,15 +141,22 @@ def is_safe_relative_directory(value: str) -> bool:
 
 
 def deterministic_candidates(
-    query: FileQuery, candidates: list[FileCandidate], limit: int = 200
+    query: FileQuery,
+    candidates: list[FileCandidate],
+    limit: int = 200,
+    preferred_extensions: tuple[str, ...] = (),
+    recent_by: str = "modified",
+    recent_first: bool = False,
 ) -> tuple[FileCandidate, ...]:
-    """Filter by explicit metadata first, then rank filename/path token overlap."""
+    """Keep lexical matches when present; otherwise recall recent files for model review."""
     if limit < 1:
         raise ValueError("limit must be positive")
+    if recent_by not in {"modified", "created"}:
+        raise ValueError("recent_by must be modified or created")
     from ai_device_bridge.services.file_catalog import _tokens
 
     query_tokens = set().union(*(_tokens(word) for word in query.keywords))
-    scored: list[tuple[int, FileCandidate]] = []
+    scored: list[tuple[int, int, float, FileCandidate]] = []
     for candidate in candidates:
         if query.extensions and not any(
             candidate.file_name.casefold().endswith(extension) for extension in query.extensions
@@ -150,17 +167,27 @@ def deterministic_candidates(
         if query.modified_before and candidate.modified_at >= query.modified_before:
             continue
         overlap = len(query_tokens & _tokens(candidate.relative_path))
-        if query_tokens and not overlap:
-            continue
-        scored.append((overlap, candidate))
+        type_match = int(
+            bool(preferred_extensions)
+            and candidate.file_name.casefold().endswith(preferred_extensions)
+        )
+        recent_at = (
+            candidate.created_at
+            if recent_by == "created" and candidate.created_at
+            else candidate.modified_at
+        )
+        scored.append((type_match, overlap, recent_at.timestamp(), candidate))
+    if query_tokens and not preferred_extensions and any(item[1] for item in scored):
+        scored = [item for item in scored if item[1]]
     scored.sort(
         key=lambda entry: (
             -entry[0],
-            -entry[1].modified_at.timestamp(),
-            entry[1].relative_path.casefold(),
+            -entry[2] if recent_first else -entry[1],
+            -entry[1] if recent_first else -entry[2],
+            entry[3].relative_path.casefold(),
         )
     )
-    return tuple(candidate for _score, candidate in scored[:limit])
+    return tuple(candidate for _type, _overlap, _time, candidate in scored[:limit])
 
 
 def search_intent(
@@ -174,7 +201,21 @@ def search_intent(
     intent = parse_transfer_intent(request, paired_device_names)
     authorized_root = str(Path(root).expanduser().resolve(strict=True))
     catalog = discover_files(authorized_root)
-    considered = deterministic_candidates(intent.file_query, catalog)
+    preferred_extensions = (
+        ARCHIVE_EXTENSIONS
+        if re.search(r"压缩包|压缩文件|归档文件|打包文件", request)
+        else ()
+    )
+    recent_by = (
+        "created"
+        if re.search(r"(?:最近|最新).{0,4}下载", request)
+        else "modified"
+    )
+    recent_requested = "最近" in request or "最新" in request
+    considered = deterministic_candidates(
+        intent.file_query, catalog, preferred_extensions=preferred_extensions,
+        recent_by=recent_by, recent_first=recent_requested,
+    )
     if not considered:
         message = (
             "授权目录中没有可检索的普通文件；请检查目录或手动选择文件。"
@@ -183,13 +224,14 @@ def search_intent(
         )
         return IntentSearchResult(
             intent, (), (), message, "local", request, authorized_root, len(catalog),
+            recent_by,
         )
     if not (
         intent.file_query.keywords
         or intent.file_query.extensions
         or intent.file_query.modified_after
     ):
-        selected = considered[:10]
+        selected = considered[:5]
         clarification = (
             "按修改时间展示最近的候选；如未看到目标文件，请补充文件名或类型。"
         )
@@ -197,26 +239,29 @@ def search_intent(
             clarification = f"{clarification} {intent.clarification_question}"
         return IntentSearchResult(
             intent, selected, considered, clarification, "local", request, authorized_root,
-            len(catalog),
+            len(catalog), recent_by,
         )
     try:
         ranked = rank_candidates_with_ollama(request, list(considered), ollama_url, model)
-        selected = ranked.candidates
+        selected = ranked.candidates[:5] if recent_requested else ranked.candidates
         source = "ollama"
         clarification = (
-            "模型未选出有效候选，请修改描述或手动选择文件。"
+            "模型未选出有效候选，请核对本地匹配文件。"
             if not selected
             else "找到多份候选，请逐项核对并选择一份。"
             if len(selected) > 1
             else ""
         )
+        if not selected:
+            selected = considered[:5]
+            source = "local"
     except FileCatalogError:
-        selected = considered[:10]
+        selected = considered[:5] if recent_requested else considered[:10]
         source = "local"
         clarification = "Ollama 未完成排序，显示本地匹配结果；请人工核对。"
     if intent.clarification_question:
         clarification = f"{clarification} {intent.clarification_question}".strip()
     return IntentSearchResult(
         intent, selected, considered, clarification, source, request, authorized_root,
-        len(catalog),
+        len(catalog), recent_by,
     )

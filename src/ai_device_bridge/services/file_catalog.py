@@ -25,6 +25,7 @@ class FileCandidate:
     file_name: str
     file_size_bytes: int
     modified_at: datetime
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,13 @@ def discover_files(directory: str | Path, max_files: int = 20_000) -> list[FileC
             file_name=path.name,
             file_size_bytes=stat.st_size,
             modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+            created_at=(
+                datetime.fromtimestamp(
+                    getattr(stat, "st_birthtime", stat.st_ctime), UTC
+                )
+                if os.name == "nt"
+                else None
+            ),
         )
         for index, (path, _root, stat) in enumerate(discovered, start=1)
     ]
@@ -128,6 +136,7 @@ def rank_candidates_with_ollama(
             "relative_path": item.relative_path,
             "size_bytes": item.file_size_bytes,
             "modified_at": item.modified_at.isoformat(),
+            "created_at": item.created_at.isoformat() if item.created_at else None,
         }
         for item in shortlist
     ]

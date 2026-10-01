@@ -159,6 +159,108 @@ def test_recent_files_are_sorted_without_an_arbitrary_age_cutoff(
     assert "不限制日期" in result.clarification
 
 
+def test_recent_request_shows_at_most_five_files(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    for index in range(9):
+        path = root / f"file-{index}.txt"
+        path.write_text("x", encoding="utf-8")
+        stamp = datetime(2020, 1, 1, tzinfo=UTC).timestamp() + index * 60
+        os.utime(path, (stamp, stamp))
+
+    def should_not_call_model(*_args, **_kwargs):
+        raise AssertionError("generic recency does not need model ranking")
+
+    monkeypatch.setattr(
+        "ai_device_bridge.services.file_catalog.httpx.post", should_not_call_model
+    )
+    result = search_intent(str(root), "找最近的文件", (), "http://127.0.0.1:11434", "model")
+    assert result.scanned_count == 9
+    assert [item.file_name for item in result.candidates] == [
+        "file-8.txt", "file-7.txt", "file-6.txt", "file-5.txt", "file-4.txt"
+    ]
+
+
+def test_downloaded_archive_is_recalled_from_large_directory_and_ranked_by_model(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "Downloads"
+    root.mkdir()
+    archive = root / "AI-Device-Bridge-M4-0.4.0rc2.zip"
+    archive.write_bytes(b"PK")
+    old_stamp = datetime(2020, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(archive, (old_stamp, old_stamp))
+    for index in range(250):
+        (root / f"unrelated-{index}.txt").write_text("x", encoding="utf-8")
+    seen = {}
+
+    def fake_post(url, json: dict, **_kwargs):
+        payload = json_lib.loads(json["messages"][1]["content"])
+        seen["candidate_names"] = [item["name"] for item in payload["candidates"]]
+        archive_id = next(
+            item["id"] for item in payload["candidates"]
+            if item["name"] == archive.name
+        )
+        return httpx.Response(
+            200,
+            json={"message": {"content": json_lib.dumps({
+                "candidate_ids": [archive_id], "clarification": ""
+            })}},
+            request=httpx.Request("POST", url),
+        )
+
+    json_lib = json
+    monkeypatch.setattr("ai_device_bridge.services.file_catalog.httpx.post", fake_post)
+    result = search_intent(
+        str(root), "找最近下载的压缩包准备发给台式机", ("台式机",),
+        "http://127.0.0.1:11434", "model",
+    )
+    assert result.scanned_count == 251
+    assert archive.name in seen["candidate_names"]
+    assert len(seen["candidate_names"]) <= 200
+    assert [item.file_name for item in result.candidates] == [archive.name]
+    assert result.intent.target_device_name == "台式机"
+
+
+def test_downloaded_archive_still_appears_when_ollama_is_offline(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "Downloads"
+    root.mkdir()
+    (root / "project.zip").write_bytes(b"PK")
+    (root / "notes.txt").write_text("notes", encoding="utf-8")
+
+    def offline(url, **_kwargs):
+        raise httpx.ConnectError("offline", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("ai_device_bridge.services.file_catalog.httpx.post", offline)
+    result = search_intent(
+        str(root), "找最近下载的压缩包", (),
+        "http://127.0.0.1:11434", "model",
+    )
+    assert result.ranking_source == "local"
+    assert result.candidates[0].file_name == "project.zip"
+    assert "创建时间" in result.clarification
+
+
+def test_download_recency_prefers_creation_time_when_available() -> None:
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    older_download = FileCandidate(
+        "F00001", "/downloads/下载.zip", "下载.zip", "下载.zip", 1,
+        datetime(2026, 9, 30, tzinfo=UTC), datetime(2026, 9, 30, tzinfo=UTC),
+    )
+    new_download = FileCandidate(
+        "F00002", "/downloads/b.zip", "b.zip", "b.zip", 1,
+        datetime(2020, 1, 1, tzinfo=UTC), now,
+    )
+    query = parse_transfer_intent("找最近下载的压缩包", (), now).file_query
+    result = deterministic_candidates(
+        query, [older_download, new_download],
+        preferred_extensions=(".zip",), recent_by="created", recent_first=True,
+    )
+    assert [item.file_name for item in result] == ["b.zip", "下载.zip"]
+
+
 @pytest.mark.parametrize(
     ("description", "expected"),
     [
