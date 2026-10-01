@@ -3,11 +3,13 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
-    throw "Python launcher 'py' was not found. Install Python 3.12 first."
+$BasePython = "python"
+$PythonArguments = @()
+if (Get-Command py -ErrorAction SilentlyContinue) {
+    $BasePython = "py"
+    $PythonArguments = @("-3.12")
 }
-
-py -3.12 --version
+& $BasePython @PythonArguments -c "import sys; assert sys.version_info[:2] == (3, 12)"
 if ($LASTEXITCODE -ne 0) {
     throw "Python 3.12 was not found. Install Python 3.12 and try again."
 }
@@ -15,7 +17,7 @@ if ($LASTEXITCODE -ne 0) {
 $VenvDir = Join-Path $env:LOCALAPPDATA "AI-Device-Bridge\release-venv"
 $Python = Join-Path $VenvDir "Scripts\python.exe"
 if (-not (Test-Path $Python)) {
-    py -3.12 -m venv $VenvDir
+    & $BasePython @PythonArguments -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the virtual environment." }
 }
 
@@ -29,6 +31,7 @@ $DistDirectory = Join-Path $ProjectRoot "build\release-dist"
 $WorkDirectory = Join-Path $ProjectRoot "build\release-work"
 $PortableDirectory = Join-Path $DistDirectory "AI Device Bridge"
 Remove-Item $DistDirectory, $WorkDirectory -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
 # PyInstaller's built-in PySide6 hooks collect the Qt libraries and plugins
 # used by this Qt Widgets app. Collecting all of PySide6 also copies unused
 # QML development artifacts and can exceed Windows path limits.
@@ -41,6 +44,7 @@ Remove-Item $DistDirectory, $WorkDirectory -Recurse -Force -ErrorAction Silently
     --paths (Join-Path $ProjectRoot "src") `
     --distpath $DistDirectory `
     --workpath $WorkDirectory `
+    --specpath $WorkDirectory `
     --exclude-module PySide6.QtQml `
     --exclude-module PySide6.QtQuick `
     --exclude-module PySide6.QtQuickControls2 `
@@ -62,6 +66,8 @@ $PortableZip = Join-Path $ReleaseDirectory "AI-Device-Bridge-portable-windows-x6
 Compress-Archive -Path (Join-Path $PortableDirectory "*") -DestinationPath $PortableZip -Force
 
 $IsccPath = $null
+$InstallerPath = Join-Path $ReleaseDirectory "AI-Device-Bridge-Setup.exe"
+Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
 $IsccCommand = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
 if ($IsccCommand) {
     $IsccPath = $IsccCommand.Source
@@ -81,9 +87,17 @@ if ($IsccCommand) {
 if ($IsccPath) {
     & $IsccPath "/O$ReleaseDirectory" (Join-Path $ProjectRoot "installer\AI-Device-Bridge.iss")
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to create the installer." }
+    if (-not (Test-Path $InstallerPath)) { throw "Installer output was not found." }
     Write-Host "Installer created in $ReleaseDirectory"
 } else {
     Write-Warning "Inno Setup 6 was not found; the portable Windows ZIP was created. Install Inno Setup 6 and rerun to create the installer."
 }
 
 Write-Host "Portable application package: $PortableZip"
+$Artifacts = @($PortableZip)
+if (Test-Path $InstallerPath) { $Artifacts += $InstallerPath }
+$Checksums = foreach ($Artifact in $Artifacts) {
+    $Hash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$Hash  $(Split-Path $Artifact -Leaf)"
+}
+$Checksums | Set-Content (Join-Path $ReleaseDirectory "SHA256SUMS.txt") -Encoding ascii

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import ssl
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Event
 from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
@@ -64,6 +66,7 @@ def send_file(
     on_progress: Callable[[int], None] | None = None,
     on_phase: Callable[[str], None] | None = None,
     cancel_event: Event | None = None,
+    require_receiver_approval: bool = True,
 ) -> dict[str, object]:
     source = Path(source_path)
     if not source.is_file():
@@ -110,8 +113,6 @@ def send_file(
         "X-File-SHA256": expected_sha256,
     }
     _check_cancel(cancel_event)
-    if on_phase is not None:
-        on_phase("transferring")
     try:
         with httpx.Client(
             verify=verify_context,
@@ -119,6 +120,58 @@ def send_file(
             follow_redirects=False,
             trust_env=False,
         ) as client:
+            if require_receiver_approval:
+                if on_phase is not None:
+                    on_phase("waiting_receiver")
+                request_response = client.post(
+                    f"{base_url}/api/v1/transfers/requests",
+                    headers={"Authorization": f"Bearer {receive_token}"},
+                    json={
+                        "file_name": file_name,
+                        "target_directory": target_directory,
+                        "file_size_bytes": size,
+                        "sha256": expected_sha256,
+                    },
+                )
+                request_response.raise_for_status()
+                request_id = str(UUID(request_response.json()["request_id"]))
+                deadline = time.monotonic() + 95
+                try:
+                    while time.monotonic() < deadline:
+                        _check_cancel(cancel_event)
+                        status_response = client.get(
+                            f"{base_url}/api/v1/transfers/requests/{request_id}",
+                            headers={"Authorization": f"Bearer {receive_token}"},
+                        )
+                        status_response.raise_for_status()
+                        status = status_response.json().get("status")
+                        if status == "approved":
+                            break
+                        if status in {"rejected", "expired"}:
+                            raise FileTransferError(
+                                "接收端已拒绝或确认超时，文件未上传。", "receiver_rejected"
+                            )
+                        if status != "pending":
+                            raise FileTransferError("接收端确认状态无效，文件未上传。")
+                        time.sleep(0.5)
+                    else:
+                        raise FileTransferError(
+                            "等待接收端确认超时，文件未上传。", "receiver_timeout"
+                        )
+                except (TransferCancelled, FileTransferError):
+                    try:
+                        client.delete(
+                            f"{base_url}/api/v1/transfers/requests/{request_id}",
+                            headers={"Authorization": f"Bearer {receive_token}"},
+                            timeout=2.0,
+                        )
+                    except httpx.RequestError:
+                        pass
+                    raise
+                url = f"{base_url}/api/v1/transfers/{request_id}"
+            _check_cancel(cancel_event)
+            if on_phase is not None:
+                on_phase("transferring")
             response = client.put(
                 url,
                 headers=headers,
@@ -154,6 +207,8 @@ def send_file(
         ) from error
     except ValueError as error:
         raise FileTransferError("接收设备返回了无法解析的响应。", "bad_receipt") from error
+    except (KeyError, TypeError) as error:
+        raise FileTransferError("接收设备返回了无效的确认请求。", "bad_receipt") from error
     except OSError as error:
         raise FileTransferError(
             "读取源文件失败，请检查文件或磁盘。", "source_read_failed"

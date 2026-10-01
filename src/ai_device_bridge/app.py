@@ -101,6 +101,25 @@ class FileInspectionWorker(QThread):
             self.failed.emit(str(error))
 
 
+class NodeServerStartWorker(QThread):
+    """Start TLS service without freezing the desktop interface."""
+
+    succeeded = Signal()
+    failed = Signal(str)
+
+    def __init__(self, node_server: NodeServer) -> None:
+        super().__init__()
+        self.node_server = node_server
+
+    def run(self) -> None:
+        try:
+            self.node_server.start()
+        except (RuntimeError, OSError, ValueError) as error:
+            self.failed.emit(str(error))
+        else:
+            self.succeeded.emit()
+
+
 class FileTransferWorker(QThread):
     """Send a confirmed plan without blocking the Qt event loop."""
 
@@ -117,6 +136,7 @@ class FileTransferWorker(QThread):
         cert_pem: str,
         token: str,
         repository: SQLiteRepository,
+        require_receiver_approval: bool = True,
     ) -> None:
         super().__init__()
         self.plan = plan
@@ -124,6 +144,7 @@ class FileTransferWorker(QThread):
         self.cert_pem = cert_pem
         self.token = token
         self.repository = repository
+        self.require_receiver_approval = require_receiver_approval
         self.cancel_event = Event()
 
     def cancel(self) -> None:
@@ -136,7 +157,9 @@ class FileTransferWorker(QThread):
             last_saved_bytes = 0
 
             def phase_changed(phase: str) -> None:
-                if phase == "transferring":
+                if phase == "waiting_receiver":
+                    journal.transition(TransferStatus.WAITING_RECEIVER)
+                elif phase == "transferring":
                     journal.transition(TransferStatus.TRANSFERRING)
                 elif phase == "verifying":
                     journal.transition(TransferStatus.VERIFYING)
@@ -164,6 +187,7 @@ class FileTransferWorker(QThread):
                 on_phase=phase_changed,
                 on_progress=progress_changed,
                 cancel_event=self.cancel_event,
+                require_receiver_approval=self.require_receiver_approval,
             )
             journal.transition(TransferStatus.COMPLETED)
             self.succeeded.emit(result)
@@ -181,7 +205,10 @@ class FileTransferWorker(QThread):
                 TransferStatus.FAILED,
             }:
                 try:
-                    journal.fail(getattr(error, "code", "local_error"), str(error))
+                    if getattr(error, "code", "") == "receiver_rejected":
+                        journal.transition(TransferStatus.REJECTED)
+                    else:
+                        journal.fail(getattr(error, "code", "local_error"), str(error))
                 except (sqlite3.Error, ValueError):
                     pass
             self.failed.emit(str(error))
@@ -234,9 +261,12 @@ class MainWindow(QMainWindow):
         self.local_device_id = local_device_id
         self.local_fingerprint = local_fingerprint
         self.receive_token = receive_token
+        self.selected_receive_grant = ""
+        self.reviewing_receive_request = False
         self.diagnostics = diagnostics
         self.last_issue = ""
         self.health_worker: HealthCheckWorker | None = None
+        self.start_worker: NodeServerStartWorker | None = None
         self.file_worker: FileInspectionWorker | None = None
         self.transfer_worker: FileTransferWorker | None = None
         self.search_worker: FileSearchWorker | None = None
@@ -255,9 +285,10 @@ class MainWindow(QMainWindow):
         intro = QLabel("M5：查找并审核文件、选择接收设备后，通过 HTTPS 传输并校验 SHA-256。")
         intro.setWordWrap(True)
         self.guide_label = QLabel(
-            "首次使用：① 在“设备与配对”页，两台电脑启动服务，检查地址并核对 TLS 指纹；"
-            "② 在“发送文件”页保存接收端授权码，选择文件并确认计划；"
-            "③ 发送后到“历史与诊断”页查看结果。要用 AI 查找文件，请打开“AI 查找”页。"
+            "首次使用：① 两台电脑在“设备与配对”页互相检查地址、核对 TLS 指纹并保存配对；"
+            "② 接收电脑选中发送设备，复制该设备专用授权码到发送电脑；"
+            "③ 在“发送文件”页确认计划并发送，接收电脑同意后才会上传。"
+            "结果在“历史与诊断”页查看，AI 候选在“AI 查找”页审核。"
         )
         self.guide_label.setWordWrap(True)
         self.dismiss_guide_button = QPushButton("已了解，隐藏指引")
@@ -271,12 +302,17 @@ class MainWindow(QMainWindow):
             f"本机 TLS 指纹（首次配对请与对端屏幕核对）：\n{local_fingerprint}"
         )
         self.local_fingerprint_label.setWordWrap(True)
-        self.receive_token_field = QLineEdit(receive_token)
+        self.receive_token_field = QLineEdit()
         self.receive_token_field.setReadOnly(True)
-        self.copy_token_button = QPushButton("复制本机接收授权码")
+        self.receive_token_field.setPlaceholderText("选中已配对的发送设备后显示专用接收授权码")
+        self.copy_token_button = QPushButton("复制所选设备授权码")
+        self.copy_token_button.setEnabled(False)
         self.copy_token_button.clicked.connect(
-            lambda: QApplication.clipboard().setText(self.receive_token)
+            lambda: QApplication.clipboard().setText(self.selected_receive_grant)
         )
+        self.rotate_grant_button = QPushButton("轮换授权码")
+        self.rotate_grant_button.setEnabled(False)
+        self.rotate_grant_button.clicked.connect(self.rotate_selected_receive_grant)
         self.start_button = QPushButton("启动本机服务")
         self.stop_button = QPushButton("停止本机服务")
         self.stop_button.setEnabled(False)
@@ -308,7 +344,8 @@ class MainWindow(QMainWindow):
 
         note = QLabel(
             "首次配对时请通过可信渠道核对双方显示的 TLS 指纹。"
-            "将接收电脑的授权码粘贴到发送电脑后，再发送计划。"
+            "两台电脑都要保存对方为已配对设备。接收电脑选中发送设备，"
+            "将该设备专用授权码复制到发送电脑。每次发送还需接收电脑确认。"
         )
         note.setWordWrap(True)
 
@@ -320,9 +357,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.local_status)
         layout.addWidget(self.local_fingerprint_label)
         token_controls = QHBoxLayout()
-        token_controls.addWidget(QLabel("本机接收授权码"))
+        token_controls.addWidget(QLabel("所选设备接收授权码"))
         token_controls.addWidget(self.receive_token_field, 1)
         token_controls.addWidget(self.copy_token_button)
+        token_controls.addWidget(self.rotate_grant_button)
         layout.addLayout(token_controls)
         layout.addLayout(local_controls)
         layout.addSpacing(20)
@@ -441,6 +479,10 @@ class MainWindow(QMainWindow):
         self.history_timer.setInterval(3000)
         self.history_timer.timeout.connect(self.refresh_transfer_history)
         self.history_timer.start()
+        self.receive_timer = QTimer(self)
+        self.receive_timer.setInterval(1000)
+        self.receive_timer.timeout.connect(self.review_pending_receives)
+        self.receive_timer.start()
         layout.addStretch()
         self.send_page = self._add_page("发送文件", layout)
 
@@ -666,6 +708,10 @@ class MainWindow(QMainWindow):
         self.search_result = result
         self.candidate_list.clear()
         self.selected_peer_id = None
+        self.selected_receive_grant = ""
+        self.receive_token_field.clear()
+        self.copy_token_button.setEnabled(False)
+        self.rotate_grant_button.setEnabled(False)
         self.selected_peer_label.setText("接收设备：未选择")
         self.peer_list.setCurrentRow(-1)
         self.peer_token.clear()
@@ -788,15 +834,24 @@ class MainWindow(QMainWindow):
         self.file_worker.start()
 
     def start_local_service(self) -> None:
-        try:
-            self.node_server.start()
-        except RuntimeError as error:
-            self._record_issue("LOCAL_SERVICE_START_FAILED", str(error))
-            self.local_status.setText(f"本机服务启动失败：{error}")
+        if self.start_worker is not None and self.start_worker.isRunning():
             return
+        self.local_status.setText("正在启动本机服务……")
+        self.start_button.setEnabled(False)
+        self.start_worker = NodeServerStartWorker(self.node_server)
+        self.start_worker.succeeded.connect(self.on_local_service_started)
+        self.start_worker.failed.connect(self.on_local_service_start_failed)
+        self.start_worker.start()
+
+    def on_local_service_started(self) -> None:
         self.local_status.setText("本机服务已启动，监听端口 8765。")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+
+    def on_local_service_start_failed(self, message: str) -> None:
+        self._record_issue("LOCAL_SERVICE_START_FAILED", message)
+        self.local_status.setText(f"本机服务启动失败：{message}")
+        self.start_button.setEnabled(True)
 
     def stop_local_service(self) -> None:
         try:
@@ -834,6 +889,10 @@ class MainWindow(QMainWindow):
         self.last_checked_peer = None
         self.pair_button.setEnabled(False)
         self.selected_peer_id = None
+        self.selected_receive_grant = ""
+        self.receive_token_field.clear()
+        self.copy_token_button.setEnabled(False)
+        self.rotate_grant_button.setEnabled(False)
         self.selected_peer_label.setText("接收设备：未选择")
         self.update_plan_button_state()
 
@@ -917,11 +976,72 @@ class MainWindow(QMainWindow):
             self.peer_address.setText(address)
             self.selected_peer_id = device_id
             self.peer_status.setText("已载入该设备保存的地址；点击“检查设备”刷新在线状态。")
+        self.selected_receive_grant = self.repository.get_or_create_receive_grant(device_id)
+        if self.diagnostics is not None:
+            self.diagnostics.add_secret(self.selected_receive_grant)
+        self.receive_token_field.setText(self.selected_receive_grant)
+        self.copy_token_button.setEnabled(True)
+        self.rotate_grant_button.setEnabled(True)
         device = self.repository.get_device(device_id)
         self.selected_peer_label.setText(
             f"接收设备：{device.device_name}" if device else "接收设备：未选择"
         )
         self.update_plan_button_state()
+
+    def rotate_selected_receive_grant(self) -> None:
+        if self.selected_peer_id is None:
+            return
+        answer = QMessageBox.question(
+            self, "轮换设备授权码",
+            "旧授权码会立即失效，正在等待的接收请求会被拒绝。"
+            "需要把新授权码复制到发送电脑。确定轮换吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.selected_receive_grant = self.repository.rotate_receive_grant(
+            self.selected_peer_id
+        )
+        if self.diagnostics is not None:
+            self.diagnostics.add_secret(self.selected_receive_grant)
+        self.receive_token_field.setText(self.selected_receive_grant)
+        self.peer_status.setText("设备接收授权码已轮换。请将新授权码复制到发送电脑。")
+
+    def review_pending_receives(self) -> None:
+        if self.reviewing_receive_request or not getattr(self.node_server, "is_running", False):
+            return
+        pending = self.repository.list_pending_receive_requests()
+        if not pending:
+            return
+        request = pending[0]
+        sender = self.repository.get_device(request.sender_device_id)
+        sender_name = sender.device_name if sender else str(request.sender_device_id)
+        self.reviewing_receive_request = True
+        try:
+            self.raise_()
+            self.activateWindow()
+            answer = QMessageBox.question(
+                self, "确认接收文件",
+                f"发送设备：{sender_name}\n文件：{request.file_name}\n"
+                f"大小：{request.file_size_bytes:,} 字节\n"
+                f"保存至：Received/{request.target_directory}\n"
+                f"SHA-256：{request.expected_sha256}\n\n允许这一次传输吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            accepted = self.repository.decide_receive_request(
+                request.request_id, approve=answer == QMessageBox.StandardButton.Yes
+            )
+            if accepted:
+                self.local_status.setText(
+                    "已同意此次接收，正在等待文件。" if answer == QMessageBox.StandardButton.Yes
+                    else "已拒绝此次接收，文件不会上传。"
+                )
+            else:
+                self.local_status.setText("接收请求已过期或授权已撤销，文件不会上传。")
+        finally:
+            self.reviewing_receive_request = False
 
     def choose_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择要准备发送的文件")
@@ -1310,6 +1430,9 @@ class MainWindow(QMainWindow):
     def on_transfer_phase_changed(self, phase: str) -> None:
         if phase == "checking":
             self.plan_status.setText("正在重新校验源文件……")
+        elif phase == "waiting_receiver":
+            self.plan_status.setText("已请求接收端确认；对方同意后才会上传文件……")
+            self.transfer_progress.setFormat("等待接收端确认")
         elif phase == "transferring":
             self.plan_status.setText("正在上传文件……")
             self.transfer_progress.setFormat("已上传 %p%")
@@ -1412,6 +1535,10 @@ class MainWindow(QMainWindow):
                 return
             if self.selected_peer_id == device_id:
                 self.selected_peer_id = None
+                self.selected_receive_grant = ""
+                self.receive_token_field.clear()
+                self.copy_token_button.setEnabled(False)
+                self.rotate_grant_button.setEnabled(False)
                 self.selected_peer_label.setText("接收设备：未选择")
                 self.save_peer_token_button.setEnabled(False)
                 self.peer_token.clear()
@@ -1426,6 +1553,10 @@ class MainWindow(QMainWindow):
         self.peer_status.setText(f"连接失败：{message}")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        if self.start_worker and self.start_worker.isRunning():
+            QMessageBox.information(self, "本机服务正在启动", "请稍候再关闭应用。")
+            event.ignore()
+            return
         if self.transfer_worker and self.transfer_worker.isRunning():
             QMessageBox.information(
                 self,
@@ -1463,13 +1594,16 @@ def main() -> int:
     diagnostics = DiagnosticLog(data_dir)
     try:
         repository = SQLiteRepository(data_dir / "bridge.sqlite3")
-        receive_token = repository.get_or_create_receive_token()
+        receive_token = repository.get_setting("receive_token")
         diagnostics.add_secret(receive_token)
         for peer in repository.list_paired_devices():
             peer_token, _certificate = repository.get_peer_security(peer.device_id)
             diagnostics.add_secret(peer_token)
+        for grant in repository.list_receive_grants():
+            diagnostics.add_secret(grant)
         TransferJournal.reconcile_interrupted(repository)
         repository.reconcile_incomplete_incoming()
+        repository.expire_receive_requests(all_pending=True)
         from ai_device_bridge.infrastructure.tls_identity import load_or_create_tls_identity
 
         identity = load_or_create_tls_identity(data_dir)

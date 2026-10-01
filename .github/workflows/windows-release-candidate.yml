@@ -1,0 +1,59 @@
+name: Windows release candidate
+
+on:
+  push:
+    branches: [main, "m6-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Automated tests
+        run: |
+          python -m pytest -q
+          python -m ruff check .
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build portable package and installer
+        shell: pwsh
+        run: ./scripts/build_windows_release.ps1
+      - name: Smoke check packaged and installed node
+        shell: pwsh
+        run: |
+          $portableDir = Join-Path $env:RUNNER_TEMP "bridge-portable"
+          Expand-Archive ./release/AI-Device-Bridge-portable-windows-x64.zip $portableDir
+          & (Join-Path $portableDir "AI Device Bridge.exe") --smoke-node
+          if ($LASTEXITCODE -ne 0) { throw "Portable node smoke check failed." }
+
+          $installer = Resolve-Path ./release/AI-Device-Bridge-Setup.exe
+          $installDir = Join-Path $env:RUNNER_TEMP "Bridge Installed"
+          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$installDir"
+          if ($LASTEXITCODE -ne 0) { throw "Silent install failed." }
+          & (Join-Path $installDir "AI Device Bridge.exe") --smoke-node
+          if ($LASTEXITCODE -ne 0) { throw "Installed node smoke check failed." }
+
+          $dataDir = Join-Path $env:APPDATA "AI Device Bridge"
+          New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+          $marker = Join-Path $dataDir "ci-retention.txt"
+          Set-Content -LiteralPath $marker -Value "preserve user data"
+          & (Join-Path $installDir "unins000.exe") /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+          if ($LASTEXITCODE -ne 0) { throw "Silent uninstall failed." }
+          if (-not (Test-Path $marker)) { throw "Uninstall removed user data." }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-Device-Bridge-Windows-candidate
+          path: |
+            release/AI-Device-Bridge-portable-windows-x64.zip
+            release/AI-Device-Bridge-Setup.exe
+            release/SHA256SUMS.txt
+          if-no-files-found: error

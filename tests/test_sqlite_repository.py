@@ -322,6 +322,34 @@ def test_m4_unversioned_database_upgrades_without_losing_user_data(tmp_path) -> 
     assert SQLiteRepository(path).schema_version() == SCHEMA_VERSION
 
 
+def test_m5_upgrade_preserves_data_without_trusting_old_shared_token(tmp_path) -> None:
+    path = tmp_path / "bridge.sqlite3"
+    previous = SQLiteRepository(path)
+    sender = DeviceProfile(uuid4(), "Sender", "fingerprint", "Windows", datetime.now(UTC))
+    previous.save_peer(sender, "10.0.0.2:8765", "certificate", "outbound-token")
+    old_shared = previous.get_or_create_receive_token()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE receive_requests")
+        connection.execute("DROP TABLE receive_grants")
+        connection.execute("PRAGMA user_version = 3")
+
+    upgraded = SQLiteRepository(path)
+    assert upgraded.schema_version() == SCHEMA_VERSION
+    assert upgraded.get_or_create_receive_token() == old_shared
+    assert upgraded.get_peer_security(sender.device_id) == ("outbound-token", "certificate")
+    assert upgraded.authorized_sender(old_shared) is None
+    assert upgraded.list_receive_grants() == []
+    grant = upgraded.get_or_create_receive_grant(sender.device_id)
+    assert upgraded.authorized_sender(grant) == sender.device_id
+
+    changed = DeviceProfile(
+        sender.device_id, "Sender", "changed-fingerprint", "Windows", datetime.now(UTC)
+    )
+    upgraded.save_peer(changed, "10.0.0.2:8765", "new-certificate")
+    assert upgraded.authorized_sender(grant) is None
+    assert upgraded.get_peer_security(sender.device_id) == ("", "new-certificate")
+
+
 def test_newer_schema_is_rejected_without_modifying_database(tmp_path) -> None:
     path = tmp_path / "future.sqlite3"
     with sqlite3.connect(path) as connection:

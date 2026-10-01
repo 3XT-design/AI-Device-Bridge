@@ -2,15 +2,17 @@ import errno
 import hashlib
 import platform
 import socket
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from ai_device_bridge import __version__
 from ai_device_bridge.api.health import API_VERSION, STAGING_DIRECTORY_NAME, create_app
-from ai_device_bridge.domain.models import TransferStatus
+from ai_device_bridge.domain.models import DeviceProfile, TransferStatus
 from ai_device_bridge.infrastructure.node_server import cleanup_orphaned_parts
 from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
 from ai_device_bridge.services.peer_health import PeerHealthError, normalize_base_url
@@ -50,7 +52,9 @@ def test_normalize_base_url_rejects_paths_and_invalid_schemes() -> None:
 
 def test_receive_transfer_requires_token_and_checks_hash(tmp_path) -> None:
     token = "example-receiver-token-that-is-long-enough"
-    client = TestClient(create_app(receive_token=token, receive_directory=tmp_path))
+    client = TestClient(create_app(
+        receive_token=token, receive_directory=tmp_path, require_receiver_approval=False
+    ))
     content = b"verified file contents"
     digest = hashlib.sha256(content).hexdigest()
     headers = {
@@ -79,7 +83,10 @@ def test_receive_transfer_reports_disk_full_without_publishing(tmp_path, monkeyp
     token = "example-receiver-token-that-is-long-enough"
     repository = SQLiteRepository(tmp_path / "history.sqlite3")
     client = TestClient(
-        create_app(receive_token=token, receive_directory=tmp_path, repository=repository)
+        create_app(
+            receive_token=token, receive_directory=tmp_path, repository=repository,
+            require_receiver_approval=False,
+        )
     )
     content = b"payload"
     headers = {
@@ -125,7 +132,9 @@ def test_startup_cleanup_only_removes_bridge_temporary_uploads(tmp_path) -> None
 
 def test_receive_transfer_rejects_bad_hash_traversal_and_overwrite(tmp_path) -> None:
     token = "example-receiver-token-that-is-long-enough"
-    client = TestClient(create_app(receive_token=token, receive_directory=tmp_path))
+    client = TestClient(create_app(
+        receive_token=token, receive_directory=tmp_path, require_receiver_approval=False
+    ))
     content = b"payload"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -165,3 +174,74 @@ def test_receive_transfer_rejects_bad_hash_traversal_and_overwrite(tmp_path) -> 
     duplicate = client.put("/api/v1/transfers", headers=correct_headers, content=content)
     assert duplicate.status_code == 409
     assert (tmp_path / "Inbox" / "report.txt").read_bytes() == content
+
+
+def test_strict_receiver_requires_paired_grant_and_one_time_approval(tmp_path) -> None:
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    sender = DeviceProfile(uuid4(), "Sender", "fingerprint", "Windows", datetime.now(UTC))
+    repository.save_peer(sender, "127.0.0.1:8765", certificate_pem="certificate")
+    grant = repository.get_or_create_receive_grant(sender.device_id)
+    legacy = "old-shared-receive-token"
+    client = TestClient(create_app(
+        receive_token=legacy, receive_directory=tmp_path / "Received",
+        repository=repository, require_receiver_approval=True,
+    ))
+    content = b"confirmed payload"
+    digest = hashlib.sha256(content).hexdigest()
+    offer = {
+        "file_name": "report.txt", "target_directory": "Inbox",
+        "file_size_bytes": len(content), "sha256": digest,
+    }
+    old_auth = {"Authorization": f"Bearer {legacy}"}
+    auth = {"Authorization": f"Bearer {grant}"}
+    upload_headers = {
+        **auth, "X-File-Name": "report.txt", "X-Target-Directory": "Inbox",
+        "X-File-Size": str(len(content)), "X-File-SHA256": digest,
+    }
+    assert client.post(
+        "/api/v1/transfers/requests", headers=old_auth, json=offer
+    ).status_code == 401
+    assert client.put(
+        "/api/v1/transfers", headers=upload_headers, content=content
+    ).status_code == 428
+    requested = client.post("/api/v1/transfers/requests", headers=auth, json=offer)
+    assert requested.status_code == 200
+    request_id = requested.json()["request_id"]
+    upload_url = f"/api/v1/transfers/{request_id}"
+    assert client.put(upload_url, headers=upload_headers, content=content).status_code == 403
+    assert not (tmp_path / "Received" / "Inbox" / "report.txt").exists()
+    assert repository.list_incoming_attempts() == []
+    assert repository.decide_receive_request(UUID(request_id), approve=False)
+    assert client.get(f"/api/v1/transfers/requests/{request_id}", headers=auth).json() == {
+        "status": "rejected"
+    }
+    assert client.put(upload_url, headers=upload_headers, content=content).status_code == 403
+
+    requested = client.post("/api/v1/transfers/requests", headers=auth, json=offer)
+    request_id = UUID(requested.json()["request_id"])
+    assert repository.decide_receive_request(request_id, approve=True)
+    upload_url = f"/api/v1/transfers/{request_id}"
+    assert client.put(upload_url, headers=upload_headers, content=content).status_code == 200
+    assert client.put(upload_url, headers=upload_headers, content=content).status_code == 403
+    assert (tmp_path / "Received" / "Inbox" / "report.txt").read_bytes() == content
+
+    new_grant = repository.rotate_receive_grant(sender.device_id)
+    assert new_grant != grant
+    assert client.post("/api/v1/transfers/requests", headers=auth, json=offer).status_code == 401
+    new_auth = {"Authorization": f"Bearer {new_grant}"}
+    requested = client.post("/api/v1/transfers/requests", headers=new_auth, json=offer)
+    with sqlite3.connect(repository.database_path) as connection:
+        connection.execute(
+            "UPDATE receive_requests SET expires_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE request_id = ?", (requested.json()["request_id"],),
+        )
+    assert client.get(
+        f"/api/v1/transfers/requests/{requested.json()['request_id']}", headers=new_auth
+    ).json() == {"status": "expired"}
+    assert not repository.decide_receive_request(
+        UUID(requested.json()["request_id"]), approve=True
+    )
+    assert repository.remove_device(sender.device_id)
+    assert client.post(
+        "/api/v1/transfers/requests", headers=new_auth, json=offer
+    ).status_code == 401

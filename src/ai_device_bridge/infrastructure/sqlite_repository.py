@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -25,7 +26,7 @@ from ai_device_bridge.domain.models import (
     TransferTask,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,18 @@ class HistoryEntry:
     status: TransferStatus
     occurred_at: datetime
     error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiveRequest:
+    request_id: UUID
+    sender_device_id: UUID
+    file_name: str
+    target_directory: str
+    file_size_bytes: int
+    expected_sha256: str
+    status: str
+    expires_at: datetime
 
 
 class SQLiteRepository:
@@ -203,6 +216,33 @@ class SQLiteRepository:
                     "ON incoming_transfers(status, updated_at)"
                 )
                 connection.execute("PRAGMA user_version = 3")
+            if version < 4:
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS receive_grants (
+                        device_id TEXT PRIMARY KEY REFERENCES peer_addresses(device_id)
+                            ON DELETE CASCADE,
+                        token TEXT NOT NULL UNIQUE,
+                        created_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS receive_requests (
+                        request_id TEXT PRIMARY KEY,
+                        sender_device_id TEXT NOT NULL REFERENCES devices(device_id),
+                        file_name TEXT NOT NULL,
+                        target_directory TEXT NOT NULL,
+                        file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes >= 0),
+                        expected_sha256 TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_receive_requests_status_expiry "
+                    "ON receive_requests(status, expires_at)"
+                )
+                connection.execute("PRAGMA user_version = 4")
 
     def schema_version(self) -> int:
         with self._connection() as connection:
@@ -304,6 +344,25 @@ class SQLiteRepository:
         if not normalized_address:
             raise ValueError("address must be a non-empty string")
         with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT public_key_fingerprint FROM devices WHERE device_id = ?",
+                (str(device.device_id),),
+            ).fetchone()
+            if existing is not None and existing["public_key_fingerprint"] != (
+                device.public_key_fingerprint
+            ):
+                connection.execute(
+                    "DELETE FROM receive_grants WHERE device_id = ?", (str(device.device_id),)
+                )
+                connection.execute(
+                    "UPDATE receive_requests SET status = 'rejected' "
+                    "WHERE sender_device_id = ? AND status IN ('pending', 'approved')",
+                    (str(device.device_id),),
+                )
+                connection.execute(
+                    "UPDATE peer_addresses SET transfer_token = '', certificate_pem = '' "
+                    "WHERE device_id = ?", (str(device.device_id),)
+                )
             connection.execute(
                 """INSERT INTO devices VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(device_id) DO UPDATE SET
@@ -356,6 +415,166 @@ class SQLiteRepository:
             )
             if cursor.rowcount == 0:
                 raise ValueError("请先保存该配对设备及其地址。")
+
+    def get_or_create_receive_grant(self, device_id: UUID) -> str:
+        """Issue a receiver-side secret only for an actively paired sender."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT token FROM receive_grants WHERE device_id = ?", (str(device_id),)
+            ).fetchone()
+            if row is not None:
+                return row["token"]
+            if connection.execute(
+                "SELECT 1 FROM peer_addresses WHERE device_id = ?", (str(device_id),)
+            ).fetchone() is None:
+                raise ValueError("请先与该发送设备完成配对。")
+            token = secrets.token_urlsafe(32)
+            connection.execute(
+                "INSERT INTO receive_grants VALUES (?, ?, ?)",
+                (str(device_id), token, _datetime_to_text(datetime.now(UTC))),
+            )
+        return token
+
+    def rotate_receive_grant(self, device_id: UUID) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE receive_grants SET token = ?, created_at = ? WHERE device_id = ?",
+                (token, _datetime_to_text(datetime.now(UTC)), str(device_id)),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("该设备尚无接收授权码，请先配对。")
+            connection.execute(
+                "UPDATE receive_requests SET status = 'rejected' "
+                "WHERE sender_device_id = ? AND status IN ('pending', 'approved')",
+                (str(device_id),),
+            )
+        return token
+
+    def list_receive_grants(self) -> list[str]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT token FROM receive_grants").fetchall()
+        return [row["token"] for row in rows]
+
+    def authorized_sender(self, token: str) -> UUID | None:
+        if not token:
+            return None
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT device_id, token FROM receive_grants"
+            ).fetchall()
+        for row in rows:
+            if hmac.compare_digest(row["token"], token):
+                return UUID(row["device_id"])
+        return None
+
+    def create_receive_request(
+        self,
+        sender_device_id: UUID,
+        file_name: str,
+        target_directory: str,
+        file_size_bytes: int,
+        expected_sha256: str,
+    ) -> ReceiveRequest:
+        now = datetime.now(UTC)
+        request = ReceiveRequest(
+            uuid4(), sender_device_id, file_name, target_directory,
+            file_size_bytes, expected_sha256, "pending", now + timedelta(seconds=90),
+        )
+        with self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM receive_grants WHERE device_id = ?", (str(sender_device_id),)
+            ).fetchone() is None:
+                raise ValueError("发送设备未获授权。")
+            connection.execute(
+                "INSERT INTO receive_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(request.request_id), str(sender_device_id), file_name,
+                    target_directory, file_size_bytes, expected_sha256,
+                    request.status, _datetime_to_text(now),
+                    _datetime_to_text(request.expires_at),
+                ),
+            )
+        return request
+
+    def expire_receive_requests(self, *, all_pending: bool = False) -> int:
+        with self._connection() as connection:
+            if all_pending:
+                cursor = connection.execute(
+                    "UPDATE receive_requests SET status = 'expired' "
+                    "WHERE status IN ('pending', 'approved')"
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE receive_requests SET status = 'expired' "
+                    "WHERE status IN ('pending', 'approved') AND expires_at <= ?",
+                    (_datetime_to_text(datetime.now(UTC)),),
+                )
+        return cursor.rowcount
+
+    def get_receive_request(self, request_id: UUID) -> ReceiveRequest | None:
+        self.expire_receive_requests()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM receive_requests WHERE request_id = ?", (str(request_id),)
+            ).fetchone()
+        return None if row is None else _row_to_receive_request(row)
+
+    def list_pending_receive_requests(self) -> list[ReceiveRequest]:
+        self.expire_receive_requests()
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM receive_requests WHERE status = 'pending' "
+                "ORDER BY created_at LIMIT 20"
+            ).fetchall()
+        return [_row_to_receive_request(row) for row in rows]
+
+    def decide_receive_request(self, request_id: UUID, *, approve: bool) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE receive_requests SET status = ? "
+                "WHERE request_id = ? AND status = 'pending' AND expires_at > ? "
+                "AND sender_device_id IN (SELECT device_id FROM receive_grants)",
+                (
+                    "approved" if approve else "rejected", str(request_id),
+                    _datetime_to_text(datetime.now(UTC)),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_receive_request(self, request_id: UUID, sender_device_id: UUID) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE receive_requests SET status = 'rejected' "
+                "WHERE request_id = ? AND sender_device_id = ? "
+                "AND status IN ('pending', 'approved')",
+                (str(request_id), str(sender_device_id)),
+            )
+        return cursor.rowcount == 1
+
+    def consume_receive_request(
+        self,
+        request_id: UUID,
+        sender_device_id: UUID,
+        file_name: str,
+        target_directory: str,
+        file_size_bytes: int,
+        expected_sha256: str,
+    ) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE receive_requests SET status = 'consumed' "
+                "WHERE request_id = ? AND sender_device_id = ? AND file_name = ? "
+                "AND target_directory = ? AND file_size_bytes = ? AND expected_sha256 = ? "
+                "AND status = 'approved' AND expires_at > ? "
+                "AND sender_device_id IN (SELECT device_id FROM receive_grants)",
+                (
+                    str(request_id), str(sender_device_id), file_name, target_directory,
+                    file_size_bytes, expected_sha256,
+                    _datetime_to_text(datetime.now(UTC)),
+                ),
+            )
+        return cursor.rowcount == 1
 
     def get_device(self, device_id: UUID) -> DeviceProfile | None:
         with self._connection() as connection:
@@ -410,6 +629,11 @@ class SQLiteRepository:
     def remove_device(self, device_id: UUID) -> bool:
         """Unpair a device, preserving its profile when transfer history references it."""
         with self._connection() as connection:
+            connection.execute(
+                "UPDATE receive_requests SET status = 'rejected' "
+                "WHERE sender_device_id = ? AND status IN ('pending', 'approved')",
+                (str(device_id),),
+            )
             cursor = connection.execute(
                 "DELETE FROM peer_addresses WHERE device_id = ?", (str(device_id),)
             )
@@ -428,6 +652,7 @@ class SQLiteRepository:
                     ("tasks", "sender_device_id"),
                     ("tasks", "receiver_device_id"),
                     ("transfer_records", "peer_device_id"),
+                    ("receive_requests", "sender_device_id"),
                 )
             )
             if not referenced:
@@ -858,4 +1083,17 @@ def _row_to_incoming_attempt(row: sqlite3.Row) -> IncomingTransferAttempt:
         updated_at=_text_to_datetime(row["updated_at"]),
         error_code=row["error_code"],
         error_message=row["error_message"],
+    )
+
+
+def _row_to_receive_request(row: sqlite3.Row) -> ReceiveRequest:
+    return ReceiveRequest(
+        request_id=UUID(row["request_id"]),
+        sender_device_id=UUID(row["sender_device_id"]),
+        file_name=row["file_name"],
+        target_directory=row["target_directory"],
+        file_size_bytes=row["file_size_bytes"],
+        expected_sha256=row["expected_sha256"],
+        status=row["status"],
+        expires_at=_text_to_datetime(row["expires_at"]),
     )

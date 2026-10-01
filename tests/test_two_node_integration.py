@@ -2,7 +2,7 @@ import hashlib
 import socket
 import time
 from datetime import UTC, datetime, timedelta
-from threading import Event
+from threading import Event, Thread
 from uuid import uuid4
 
 import pytest
@@ -41,6 +41,7 @@ def receiver_node(tmp_path):
         receive_token=token,
         receive_directory=receive_directory,
         repository=repository,
+        require_receiver_approval=False,
     )
     server.start()
     try:
@@ -79,6 +80,7 @@ def test_tls_pinned_transfer_is_verified_and_published_atomically(tmp_path, rece
         "Integration/Inbox",
         len(content),
         digest,
+        require_receiver_approval=False,
     )
 
     received = receiver_node["receive_directory"] / "Integration" / "Inbox" / source.name
@@ -91,6 +93,64 @@ def test_tls_pinned_transfer_is_verified_and_published_atomically(tmp_path, rece
     assert len(incoming) == 1
     assert incoming[0].status is TransferStatus.COMPLETED
     assert incoming[0].bytes_received == len(content)
+
+
+def test_strict_receiver_waits_for_local_approval_before_streaming(tmp_path) -> None:
+    identity = load_or_create_tls_identity(tmp_path / "identity")
+    repository = SQLiteRepository(tmp_path / "receiver.sqlite3")
+    sender = DeviceProfile(uuid4(), "Sender", "fingerprint", "Windows", datetime.now(UTC))
+    repository.save_peer(sender, "127.0.0.1:8765", certificate_pem="certificate")
+    grant = repository.get_or_create_receive_grant(sender.device_id)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = NodeServer(
+        host="127.0.0.1", port=port,
+        certificate_path=identity.certificate_path,
+        private_key_path=identity.private_key_path,
+        certificate_fingerprint=identity.fingerprint,
+        certificate_pem=identity.certificate_pem,
+        receive_token="old-global-token", receive_directory=tmp_path / "Received",
+        repository=repository,
+    )
+    source = tmp_path / "confirmed.txt"
+    source.write_bytes(b"receiver approved")
+    results = []
+    errors = []
+
+    def send() -> None:
+        try:
+            results.append(send_file(
+                source, f"127.0.0.1:{port}", identity.certificate_pem,
+                grant, source.name, "Inbox", source.stat().st_size,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                require_receiver_approval=True,
+            ))
+        except Exception as error:
+            errors.append(error)
+
+    server.start()
+    try:
+        worker = Thread(target=send)
+        worker.start()
+        pending = []
+        for _ in range(100):
+            pending = repository.list_pending_receive_requests()
+            if pending:
+                break
+            time.sleep(0.05)
+        assert len(pending) == 1
+        target = tmp_path / "Received" / "Inbox" / source.name
+        assert not target.exists()
+        assert not list((tmp_path / "Received").rglob("*.part"))
+        assert repository.decide_receive_request(pending[0].request_id, approve=True)
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert errors == []
+        assert results[0]["status"] == "received"
+        assert target.read_bytes() == source.read_bytes()
+    finally:
+        server.stop()
 
 
 def test_wrong_token_and_duplicate_name_do_not_replace_received_file(
@@ -113,6 +173,7 @@ def test_wrong_token_and_duplicate_name_do_not_replace_received_file(
             "Inbox",
             len(content),
             digest,
+            require_receiver_approval=False,
         )
 
     destination = receiver_node["receive_directory"] / "Inbox" / source.name
@@ -126,6 +187,7 @@ def test_wrong_token_and_duplicate_name_do_not_replace_received_file(
         "Inbox",
         len(content),
         digest,
+        require_receiver_approval=False,
     )
     source.write_text("different content", encoding="utf-8")
     changed = source.read_bytes()
@@ -139,6 +201,7 @@ def test_wrong_token_and_duplicate_name_do_not_replace_received_file(
             "Inbox",
             len(changed),
             hashlib.sha256(changed).hexdigest(),
+            require_receiver_approval=False,
         )
     assert destination.read_bytes() == content
     incoming = receiver_node["repository"].list_incoming_attempts()
@@ -174,6 +237,7 @@ def test_upload_progress_cancel_cleans_temporary_file(tmp_path, receiver_node) -
             on_progress=on_progress,
             on_phase=phases.append,
             cancel_event=cancelled,
+            require_receiver_approval=False,
         )
 
     assert progress == [1024 * 1024]
@@ -228,6 +292,7 @@ def test_desktop_transfer_worker_records_failure_and_successful_retry(
         identity.certificate_pem,
         "incorrect-token-but-long-enough-123456",
         repository,
+        require_receiver_approval=False,
     )
     first.failed.connect(failures.append)
     first.run()
@@ -242,6 +307,7 @@ def test_desktop_transfer_worker_records_failure_and_successful_retry(
         identity.certificate_pem,
         receiver_node["token"],
         repository,
+        require_receiver_approval=False,
     )
     second.succeeded.connect(results.append)
     second.progress_changed.connect(progress.append)

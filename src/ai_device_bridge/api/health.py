@@ -36,6 +36,13 @@ class HealthResponse(BaseModel):
     certificate_pem: str
 
 
+class TransferOffer(BaseModel):
+    file_name: str
+    target_directory: str
+    file_size_bytes: int
+    sha256: str
+
+
 def create_app(
     device_id: UUID | None = None,
     certificate_fingerprint: str = "",
@@ -43,10 +50,19 @@ def create_app(
     receive_token: str = "",
     receive_directory: str | Path = "received",
     repository: SQLiteRepository | None = None,
+    require_receiver_approval: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="AI Device Bridge Node", version=__version__)
     stable_device_id = device_id or uuid4()
     inbox_root = Path(receive_directory).resolve()
+
+    def authorized_sender(authorization: str | None) -> UUID:
+        if repository is None or not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="设备接收授权码无效。")
+        sender = repository.authorized_sender(authorization[len("Bearer "):])
+        if sender is None:
+            raise HTTPException(status_code=401, detail="设备未配对或接收授权已撤销。")
+        return sender
 
     @app.get("/api/v1/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -61,58 +77,82 @@ def create_app(
             certificate_pem=certificate_pem,
         )
 
+    @app.post("/api/v1/transfers/requests")
+    def request_transfer(
+        offer: TransferOffer, authorization: str | None = Header(default=None)
+    ) -> dict[str, str]:
+        if not require_receiver_approval or repository is None:
+            raise HTTPException(status_code=404, detail="接收确认服务不可用。")
+        sender = authorized_sender(authorization)
+        _validate_transfer_metadata(
+            offer.file_name, offer.target_directory, str(offer.file_size_bytes),
+            offer.sha256, inbox_root,
+        )
+        request = repository.create_receive_request(
+            sender, offer.file_name, offer.target_directory,
+            offer.file_size_bytes, offer.sha256.lower(),
+        )
+        return {"request_id": str(request.request_id), "status": request.status}
+
+    @app.get("/api/v1/transfers/requests/{request_id}")
+    def transfer_request_status(
+        request_id: UUID, authorization: str | None = Header(default=None)
+    ) -> dict[str, str]:
+        if not require_receiver_approval or repository is None:
+            raise HTTPException(status_code=404, detail="接收确认服务不可用。")
+        sender = authorized_sender(authorization)
+        entry = repository.get_receive_request(request_id)
+        if entry is None or entry.sender_device_id != sender:
+            raise HTTPException(status_code=404, detail="接收请求不存在。")
+        return {"status": entry.status}
+
+    @app.delete("/api/v1/transfers/requests/{request_id}")
+    def cancel_transfer_request(
+        request_id: UUID, authorization: str | None = Header(default=None)
+    ) -> dict[str, str]:
+        if not require_receiver_approval or repository is None:
+            raise HTTPException(status_code=404, detail="接收确认服务不可用。")
+        sender = authorized_sender(authorization)
+        if not repository.cancel_receive_request(request_id, sender):
+            raise HTTPException(status_code=404, detail="待确认接收请求不存在。")
+        return {"status": "rejected"}
+
     @app.put("/api/v1/transfers")
+    @app.put("/api/v1/transfers/{request_id}")
     async def receive_transfer(
         request: Request,
+        request_id: UUID | None = None,
         authorization: str | None = Header(default=None),
         x_file_name: str = Header(default=""),
         x_target_directory: str = Header(default=""),
         x_file_size: str = Header(default=""),
         x_file_sha256: str = Header(default=""),
     ) -> dict[str, object]:
-        expected_authorization = f"Bearer {receive_token}"
-        if (
-            not receive_token
-            or not authorization
-            or not hmac.compare_digest(authorization, expected_authorization)
-        ):
-            raise HTTPException(status_code=401, detail="接收授权码无效。")
+        if require_receiver_approval:
+            sender = authorized_sender(authorization)
+            if request_id is None:
+                raise HTTPException(status_code=428, detail="请先获得接收端逐次确认。")
+        else:
+            expected_authorization = f"Bearer {receive_token}"
+            if (
+                not receive_token or not authorization
+                or not hmac.compare_digest(authorization, expected_authorization)
+            ):
+                raise HTTPException(status_code=401, detail="接收授权码无效。")
 
-        file_name = unquote(x_file_name)
-        target_directory = unquote(x_target_directory)
-        if (
-            not file_name
-            or file_name in {".", ".."}
-            or "/" in file_name
-            or "\\" in file_name
-            or any(ord(character) < 32 for character in file_name)
-        ):
-            raise HTTPException(status_code=400, detail="文件名无效。")
-        directory_parts = target_directory.replace("\\", "/").split("/")
-        if (
-            not target_directory
-            or any(
-                part in {"", ".", ".."}
-                or ":" in part
-                or any(ord(character) < 32 for character in part)
-                for part in directory_parts
+        file_name, target_directory, expected_size, target_directory_path = (
+            _validate_transfer_metadata(
+                unquote(x_file_name), unquote(x_target_directory),
+                x_file_size, x_file_sha256, inbox_root,
             )
-            or directory_parts[0].casefold() == STAGING_DIRECTORY_NAME.casefold()
+        )
+        if require_receiver_approval and (
+            repository is None or not repository.consume_receive_request(
+                request_id, sender, file_name, target_directory,
+                expected_size, x_file_sha256.lower(),
+            )
         ):
-            raise HTTPException(status_code=400, detail="目标目录无效。")
-        try:
-            expected_size = int(x_file_size)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail="文件大小无效。") from error
-        if expected_size < 0 or not re.fullmatch(r"[0-9a-fA-F]{64}", x_file_sha256):
-            raise HTTPException(status_code=400, detail="文件大小或 SHA-256 无效。")
-
-        target_directory_path = inbox_root.joinpath(*directory_parts).resolve()
-        if not target_directory_path.is_relative_to(inbox_root):
-            raise HTTPException(status_code=400, detail="目标目录超出接收目录范围。")
-        resolved_parts = target_directory_path.relative_to(inbox_root).parts
-        if resolved_parts and resolved_parts[0].casefold() == STAGING_DIRECTORY_NAME.casefold():
-            raise HTTPException(status_code=400, detail="目标目录无效。")
+            raise HTTPException(status_code=403, detail="接收请求未批准、已过期或已使用。")
         target_path = target_directory_path / file_name
         staging_root = inbox_root / STAGING_DIRECTORY_NAME
         temporary_path = staging_root / f"{uuid4().hex}.part"
@@ -160,6 +200,10 @@ def create_app(
             target_directory_path.mkdir(parents=True, exist_ok=True)
             with temporary_path.open("xb") as output:
                 async for chunk in request.stream():
+                    if require_receiver_approval and repository is not None and (
+                        repository.authorized_sender(authorization[len("Bearer "):]) != sender
+                    ):
+                        raise HTTPException(status_code=403, detail="设备接收授权已撤销。")
                     received_size += len(chunk)
                     if received_size > expected_size:
                         raise HTTPException(status_code=413, detail="接收数据超过声明大小。")
@@ -220,6 +264,45 @@ def create_app(
         }
 
     return app
+
+
+def _validate_transfer_metadata(
+    file_name: str,
+    target_directory: str,
+    size_text: str,
+    sha256: str,
+    inbox_root: Path,
+) -> tuple[str, str, int, Path]:
+    if (
+        not file_name or file_name in {".", ".."}
+        or "/" in file_name or "\\" in file_name
+        or any(ord(character) < 32 for character in file_name)
+    ):
+        raise HTTPException(status_code=400, detail="文件名无效。")
+    directory_parts = target_directory.replace("\\", "/").split("/")
+    if (
+        not target_directory
+        or any(
+            part in {"", ".", ".."} or ":" in part
+            or any(ord(character) < 32 for character in part)
+            for part in directory_parts
+        )
+        or directory_parts[0].casefold() == STAGING_DIRECTORY_NAME.casefold()
+    ):
+        raise HTTPException(status_code=400, detail="目标目录无效。")
+    try:
+        expected_size = int(size_text)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="文件大小无效。") from error
+    if expected_size < 0 or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise HTTPException(status_code=400, detail="文件大小或 SHA-256 无效。")
+    target_directory_path = inbox_root.joinpath(*directory_parts).resolve()
+    if not target_directory_path.is_relative_to(inbox_root):
+        raise HTTPException(status_code=400, detail="目标目录超出接收目录范围。")
+    resolved_parts = target_directory_path.relative_to(inbox_root).parts
+    if resolved_parts and resolved_parts[0].casefold() == STAGING_DIRECTORY_NAME.casefold():
+        raise HTTPException(status_code=400, detail="目标目录无效。")
+    return file_name, target_directory, expected_size, target_directory_path
 
 
 def _storage_http_error(error: OSError) -> HTTPException:

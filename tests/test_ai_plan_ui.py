@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from ai_device_bridge import __version__
 from ai_device_bridge.app import MainWindow
 from ai_device_bridge.domain.models import DeviceProfile, SourceMode
-from ai_device_bridge.infrastructure.sqlite_repository import SQLiteRepository
+from ai_device_bridge.infrastructure.sqlite_repository import SCHEMA_VERSION, SQLiteRepository
 from ai_device_bridge.services.diagnostics import DiagnosticLog
 from ai_device_bridge.services.file_catalog import FileCandidate
 from ai_device_bridge.services.file_inspection import inspect_file
@@ -102,7 +102,7 @@ def test_m5_guidance_search_and_copied_diagnostics(tmp_path, monkeypatch) -> Non
     copied = application.clipboard().text()
     assert __version__ in copied
     assert "sensitive-receive-token" not in copied
-    assert "数据库版本：3" in copied
+    assert f"数据库版本：{SCHEMA_VERSION}" in copied
     window.tabs.setCurrentIndex(1)
     window.plan_filter.setText("report")
     window.tabs.setCurrentIndex(3)
@@ -112,3 +112,31 @@ def test_m5_guidance_search_and_copied_diagnostics(tmp_path, monkeypatch) -> Non
     assert window.tabs.currentIndex() == 0
     window.history_timer.stop()
     window.close()
+
+
+def test_receiver_approval_dialog_decides_pending_request(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([])
+    repository = SQLiteRepository(tmp_path / "bridge.sqlite3")
+    local = repository.get_or_create_local_device("Receiver", "Windows")
+    sender = DeviceProfile(uuid4(), "Sender", "fingerprint", "Windows", datetime.now(UTC))
+    repository.save_peer(sender, "127.0.0.1:8765", certificate_pem="certificate")
+    repository.get_or_create_receive_grant(sender.device_id)
+    request = repository.create_receive_request(
+        sender.device_id, "report.txt", "Inbox", 5, "a" * 64
+    )
+    window = MainWindow(
+        SimpleNamespace(stop=lambda: None, is_running=True), repository,
+        local.device_id, "fingerprint", "unused",
+    )
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.review_pending_receives()
+    assert repository.get_receive_request(request.request_id).status == "approved"
+    assert "已同意" in window.local_status.text()
+    window.history_timer.stop()
+    window.receive_timer.stop()
+    window.close()
+    assert application is not None

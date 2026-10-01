@@ -29,6 +29,7 @@ class NodeServer:
         receive_token: str = "",
         receive_directory: str | Path = "received",
         repository: SQLiteRepository | None = None,
+        require_receiver_approval: bool = True,
     ) -> None:
         self.host = host
         self.port = port
@@ -40,6 +41,7 @@ class NodeServer:
         self.receive_token = receive_token
         self.receive_directory = receive_directory
         self.repository = repository
+        self.require_receiver_approval = require_receiver_approval
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -66,6 +68,7 @@ class NodeServer:
                 self.receive_token,
                 self.receive_directory,
                 self.repository,
+                self.require_receiver_approval,
             ),
             host=self.host,
             port=self.port,
