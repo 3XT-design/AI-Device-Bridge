@@ -50,9 +50,11 @@ def test_replay_runs_pose_model_and_writes_timestamped_csv(tmp_path, monkeypatch
     worker = MotionCaptureWorker(str(video_path), tmp_path)
     frames = []
     completed = []
+    summaries = []
     failed = []
     worker.frame_ready.connect(lambda _image, result, _time, _cost: frames.append(result))
     worker.completed.connect(completed.append)
+    worker.summary_ready.connect(summaries.append)
     worker.failed.connect(failed.append)
     worker.start()
     until = time.monotonic() + 20
@@ -64,6 +66,9 @@ def test_replay_runs_pose_model_and_writes_timestamped_csv(tmp_path, monkeypatch
 
     assert not failed
     assert completed and "已处理" in completed[0]
+    assert len(summaries) == 1
+    assert summaries[0].processed_frames >= 1
+    assert summaries[0].valid_frames == 0
     assert len(frames) > 0
     assert all(frame.phase == "tracking_lost" for frame in frames)
     csv_files = list(tmp_path.glob("squat-*.csv"))

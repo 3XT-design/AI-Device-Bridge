@@ -548,7 +548,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         self._add_page("AI 查找", layout)
 
-        self.motion_page = MotionCapturePage()
+        self.motion_page = MotionCapturePage(repository)
         self.tabs.addTab(self.motion_page, "动作分析")
 
         layout = QVBoxLayout()
@@ -1566,7 +1566,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
         if not self.motion_page.shutdown():
-            QMessageBox.information(self, "视频分析正在停止", "请稍候再关闭应用。")
+            QMessageBox.information(
+                self, "动作分析仍在运行", "请等待视频或 Ollama 分析结束后再关闭应用。"
+            )
             event.ignore()
             return
         if self.start_worker and self.start_worker.isRunning():

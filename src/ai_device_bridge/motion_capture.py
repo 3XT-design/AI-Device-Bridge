@@ -15,12 +15,20 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSpinBox,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from ai_device_bridge.services.motion_ai import (
+    MotionAIError,
+    SquatSessionCollector,
+    SquatSessionSummary,
+    analyze_squat_with_ollama,
+)
 from ai_device_bridge.services.squat_analysis import SquatAnalyzer, SquatResult
 
 
@@ -92,6 +100,7 @@ class MotionCaptureWorker(QThread):
     status_changed = Signal(str)
     failed = Signal(str)
     completed = Signal(str)
+    summary_ready = Signal(object)
 
     def __init__(
         self, source: int | str, output_dir: Path | None = None, requested_fps: int = 30
@@ -187,6 +196,7 @@ class MotionCaptureWorker(QThread):
                         raise RuntimeError("无法创建 MP4 录像；请选择可写入的目录。")
 
             analyzer = SquatAnalyzer()
+            collector = SquatSessionCollector()
             frame_index = 0
             processed_count = 0
             skipped = 0
@@ -245,6 +255,7 @@ class MotionCaptureWorker(QThread):
                         if pose_result.pose_landmarks is not None else None
                     )
                     result = analyzer.update(landmarks, read_ns // 1_000_000)
+                    collector.add(result, read_ns)
                     inference_ms = (time.perf_counter_ns() - read_ns) / 1_000_000
                     if csv_writer is not None:
                         side_indices = SquatAnalyzer._SIDES.get(result.side, ())
@@ -300,15 +311,37 @@ class MotionCaptureWorker(QThread):
                 writer.release()
             if csv_file is not None:
                 csv_file.close()
+        self.summary_ready.emit(collector.summary())
         self.completed.emit(completion_message)
 
 
-class MotionCapturePage(QWidget):
-    """Single-computer squat baseline with live, on-screen feedback."""
+class OllamaSquatWorker(QThread):
+    succeeded = Signal(str, float)
+    failed = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, summary: SquatSessionSummary, url: str, model: str) -> None:
         super().__init__()
+        self.summary = summary
+        self.url = url
+        self.model = model
+
+    def run(self) -> None:
+        try:
+            text, elapsed = analyze_squat_with_ollama(self.summary, self.url, self.model)
+            self.succeeded.emit(text, elapsed)
+        except MotionAIError as error:
+            self.failed.emit(str(error))
+
+
+class MotionCapturePage(QWidget):
+    """Single-computer squat feedback and optional post-set Ollama analysis."""
+
+    def __init__(self, repository) -> None:
+        super().__init__()
+        self.repository = repository
         self.worker: MotionCaptureWorker | None = None
+        self.ai_worker: OllamaSquatWorker | None = None
+        self.session_summary: SquatSessionSummary | None = None
         self.latencies: deque[float] = deque(maxlen=1800)
         self.arrivals: deque[int] = deque(maxlen=1800)
         self.valid_frames = 0
@@ -367,9 +400,32 @@ class MotionCapturePage(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
+        ai_controls = QHBoxLayout()
+        self.ollama_url = QLineEdit(
+            repository.get_setting("ollama_url", "http://127.0.0.1:11434")
+        )
+        self.ollama_model = QLineEdit(repository.get_setting("ollama_model", "qwen2.5:3b"))
+        self.ollama_model.setMaximumWidth(150)
+        self.ai_button = QPushButton("AI 分析本组动作")
+        self.ai_button.setEnabled(False)
+        ai_controls.addWidget(QLabel("本机 Ollama"))
+        ai_controls.addWidget(self.ollama_url, 1)
+        ai_controls.addWidget(QLabel("模型"))
+        ai_controls.addWidget(self.ollama_model)
+        ai_controls.addWidget(self.ai_button)
+        layout.addLayout(ai_controls)
+        self.ai_result = QTextEdit()
+        self.ai_result.setReadOnly(True)
+        self.ai_result.setMaximumHeight(95)
+        self.ai_result.setPlaceholderText(
+            "一组动作结束后可用本机 Ollama 解读统计结果；动作中的提示仍由姿态分析提供。"
+        )
+        layout.addWidget(self.ai_result)
+
         self.camera_button.clicked.connect(lambda: self._start(self.camera_index.value()))
         self.video_button.clicked.connect(self.open_video)
         self.stop_button.clicked.connect(self.stop)
+        self.ai_button.clicked.connect(self.analyze_session)
 
     def open_video(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
@@ -381,6 +437,9 @@ class MotionCapturePage(QWidget):
     def _start(self, source: int | str) -> None:
         if self.worker is not None and self.worker.isRunning():
             return
+        if self.ai_worker is not None and self.ai_worker.isRunning():
+            self.status.setText("请等待上一组 Ollama 分析结束后再开始。")
+            return
         output_dir = None
         if self.save_checkbox.isChecked():
             selected = QFileDialog.getExistingDirectory(self, "选择分析记录保存目录")
@@ -391,6 +450,9 @@ class MotionCapturePage(QWidget):
         self.arrivals.clear()
         self.valid_frames = 0
         self.total_frames = 0
+        self.session_summary = None
+        self.ai_button.setEnabled(False)
+        self.ai_result.clear()
         self.camera_button.setEnabled(False)
         self.video_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -400,6 +462,7 @@ class MotionCapturePage(QWidget):
         self.worker.status_changed.connect(self.status.setText)
         self.worker.failed.connect(self.status.setText)
         self.worker.completed.connect(self.status.setText)
+        self.worker.summary_ready.connect(self._on_summary)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
@@ -412,6 +475,44 @@ class MotionCapturePage(QWidget):
         self.camera_button.setEnabled(True)
         self.video_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+
+    def _on_summary(self, summary: SquatSessionSummary) -> None:
+        self.session_summary = summary
+        self.ai_button.setEnabled(summary.valid_frames >= 10)
+        if summary.valid_frames < 10:
+            self.ai_result.setPlainText(
+                f"有效姿态帧 {summary.valid_frames} 帧，至少需要 10 帧才能做 AI 分析。"
+            )
+        else:
+            self.ai_result.setPlainText(
+                f"本组识别 {summary.repetitions} 次深蹲，有效姿态帧 "
+                f"{summary.valid_frames}/{summary.processed_frames}。点击按钮获取 Ollama 建议。"
+            )
+
+    def analyze_session(self) -> None:
+        if self.session_summary is None or self.session_summary.valid_frames < 10:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if self.ai_worker is not None and self.ai_worker.isRunning():
+            return
+        url = self.ollama_url.text().strip()
+        model = self.ollama_model.text().strip()
+        self.ai_button.setEnabled(False)
+        self.ai_result.setPlainText("本机 Ollama 正在分析本组统计结果……")
+        self.ai_worker = OllamaSquatWorker(self.session_summary, url, model)
+        self.ai_worker.succeeded.connect(self._on_ai_result)
+        self.ai_worker.failed.connect(self.ai_result.setPlainText)
+        self.ai_worker.finished.connect(self._on_ai_finished)
+        self.ai_worker.start()
+
+    def _on_ai_result(self, report: str, elapsed: float) -> None:
+        self.ai_result.setPlainText(f"{report}\n\nOllama 耗时：{elapsed:.1f} 秒")
+        self.repository.save_setting("ollama_url", self.ollama_url.text().strip())
+        self.repository.save_setting("ollama_model", self.ollama_model.text().strip())
+
+    def _on_ai_finished(self) -> None:
+        self.ai_button.setEnabled(self.session_summary is not None)
 
     def on_frame(
         self, image: QImage, result: SquatResult, read_ns: int, inference_ms: float
@@ -467,7 +568,8 @@ class MotionCapturePage(QWidget):
             )
 
     def shutdown(self) -> bool:
-        if self.worker is None or not self.worker.isRunning():
-            return True
-        self.worker.stop()
-        return self.worker.wait(4000)
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            if not self.worker.wait(4000):
+                return False
+        return self.ai_worker is None or not self.ai_worker.isRunning()
